@@ -19,7 +19,6 @@ and watch it happen in your actual Overleaf project, not in a chat window you th
 ## Table of contents
 
 - [Why this exists](#why-this-exists)
-- [⚠️ Client eligibility — read this first](#-client-eligibility--read-this-first)
 - [Features](#features)
 - [Architecture](#architecture)
 - [Quick start](#quick-start)
@@ -57,34 +56,6 @@ static API key to a custom MCP server; Gemini's custom-app flow is OAuth-only wi
 fallback; Claude supports static headers but only in a limited beta. So this server ships a real
 OAuth 2.1 authorization server (dynamic client registration, PKCE, refresh rotation, RFC 9728 /
 RFC 8414 discovery). It is not optional — without it the server simply does not connect.
-
-## ⚠️ Client eligibility — read this first
-
-The bar is very different between clients, and **Gemini's is the highest**. It may rule you out
-entirely:
-
-| | Gemini web app | Claude | ChatGPT |
-|---|---|---|---|
-| **Region** | **United States only** | No restriction | No restriction |
-| **Account type** | **Personal Google Account only** — Workspace and enterprise accounts are explicitly unsupported | Personal or team | **Primarily Business / Enterprise / Edu** |
-| **Age** | 18+ | — | — |
-| **Language** | English only | — | — |
-| **Other** | **Activity recording must be ON**, or the entry point disappears | — | — |
-| **Plan** | Google AI Pro or Ultra in practice | A free account can add one custom connector | Write access on Plus/Pro is **unconfirmed** |
-| **Where to add it** | Settings → Connected Apps → Custom apps → Add a custom app (**web app only**) | Customize → Connectors → Add → Custom → Web | chatgpt.com/plugins → "+" → Add custom MCP server |
-| **Static token** | ❌ Not supported | ⚠️ Limited beta | ❌ Not supported |
-
-**If you are outside the United States, or you sign in with a Workspace account, the Gemini web
-app path will not work for you.** Alternatives:
-
-- **Use Claude** — the lowest bar, works on a free account, and fully supported here.
-- **Gemini CLI or Antigravity** — Google's other MCP-capable surfaces, and they *do* accept custom
-  headers, so they work with `MCP_AUTH_MODE=bearer`. Separate entry points from the web app.
-- **Wait for Google to expand availability** — nothing on the server needs to change.
-
-> The Gemini details above come from Google's own help page (`support.google.com/gemini/answer/17209137`)
-> and multiple third-party reports. Google has renamed things more than once ("Custom apps" vs
-> "Custom apps for Spark", Spark vs Task), so **trust what you actually see in your own settings**.
 
 ## Features
 
@@ -213,9 +184,6 @@ https://your-domain/mcp
 ```
 
 ### Gemini web app
-
-> Prerequisites: see [client eligibility](#-client-eligibility--read-this-first) — United States,
-> personal Google Account, Activity recording on.
 
 1. Open `gemini.google.com` in a desktop browser.
 2. **Settings → Connected Apps → Custom apps → Add a custom app.**
@@ -415,7 +383,6 @@ are skipped rather than extracted.
 | Tools fail with a session error | `overleaf_session2` changes when you log out or the session expires. Copy it again. Self-hosted instances can set `OVERLEAF_EMAIL` / `OVERLEAF_PASSWORD` for automatic re-login. |
 | Changes do not appear in Overleaf | Check `pending_changes`. If `OLMCP_AUTO_PUSH=false`, you need an explicit `publish_changes`. Failed files are listed with reasons in the tool result. |
 | Compile fails but the local file looks fine | `compile` publishes first and reports an error rather than compiling stale content. Check `pending_changes`. |
-| No "Custom apps" entry in Gemini | Almost certainly region, account type, or Activity recording — see [client eligibility](#-client-eligibility--read-this-first). |
 
 Set `LOG_LEVEL=debug` to see per-call timings and failure reasons.
 
@@ -462,7 +429,6 @@ repeatably.
 
 ## Limitations
 
-- **Gemini web app region and account restrictions** are outside this project's control.
 - **Binary files** cannot be read or written through the tools; text sources (`tex`, `bib`, `cls`,
   `sty`, …) can.
 - **Concurrent edits to the same file are handled conservatively.** A file is re-fetched before
