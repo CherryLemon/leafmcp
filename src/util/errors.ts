@@ -33,7 +33,22 @@ const literalSecrets: string[] = [];
 export function registerSecret(value: string | undefined | null): void {
   // Short values would redact unrelated text; real credentials are long.
   if (typeof value !== 'string' || value.length < 8) return;
-  if (!literalSecrets.includes(value)) literalSecrets.push(value);
+
+  const variants = [value];
+  // A secret that travels in a URL or a form body appears percent-encoded, and the encoded
+  // form does not contain the literal one — so scrubbing only the raw value would miss it.
+  // Decoded once, not recursively: repeated decoding of attacker-influenced text is its own
+  // problem, and one level is what a credential actually round-trips through.
+  try {
+    const decoded = decodeURIComponent(value);
+    if (decoded !== value && decoded.length >= 8) variants.push(decoded);
+  } catch {
+    // Not percent-encoded, which is the normal case.
+  }
+
+  for (const variant of variants) {
+    if (!literalSecrets.includes(variant)) literalSecrets.push(variant);
+  }
 }
 
 /**

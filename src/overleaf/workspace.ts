@@ -44,7 +44,13 @@ import {
   type GitRepo,
 } from '../util/git.js';
 import { log } from '../util/logger.js';
-import { assertNotSymlink, normalizeRelPath, safeArchiveEntry, safeJoin } from '../util/paths.js';
+import {
+  assertInsideRealRoot,
+  assertNotSymlink,
+  normalizeRelPath,
+  safeArchiveEntry,
+  safeJoin,
+} from '../util/paths.js';
 
 export type ChangeStatus = 'added' | 'modified' | 'deleted';
 
@@ -127,9 +133,15 @@ const TEXT_EXTENSIONS = new Set([
 ]);
 
 export function looksBinary(relPath: string): boolean {
-  const ext = relPath.split('.').pop()?.toLowerCase() ?? '';
-  if (!ext || ext === relPath.toLowerCase()) return false;
-  return !TEXT_EXTENSIONS.has(ext);
+  const name = relPath.split('/').pop() ?? relPath;
+  const dot = name.lastIndexOf('.');
+
+  // A leading dot is not an extension: `.latexmkrc`, `.gitignore` and `.olignore` are
+  // configuration text. Treating them as extensionless binaries hid them from search and
+  // refused to read them, which is the opposite of what a project config deserves.
+  if (dot <= 0) return false;
+
+  return !TEXT_EXTENSIONS.has(name.slice(dot + 1).toLowerCase());
 }
 
 export class ProjectWorkspace {
@@ -487,7 +499,11 @@ export class ProjectWorkspace {
         entries.filter((e) => !e.isDirectory()).map((e) => e.name),
       );
       for (const entry of entries) {
-        if (entry.name.startsWith('.')) continue;
+        // Only git's own names are hidden. Everything else that starts with a dot is an
+        // ordinary project file — a `.latexmkrc`, a `.olignore` — and hiding it from the
+        // listing while the read tool would happily return it by name was the inconsistency:
+        // the model could not discover the file, but could still be told about it.
+        if (entry.name.toLowerCase().startsWith('.git')) continue;
         const rel = base ? `${base}/${entry.name}` : entry.name;
         if (entry.isDirectory()) {
           if (shouldIgnore(`${rel}/`, ctx)) continue;
@@ -546,6 +562,7 @@ export class ProjectWorkspace {
     }
     const path = safeJoin(this.dir, normalized);
     await assertNotSymlink(path);
+    await assertInsideRealRoot(this.dir, path);
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, content, 'utf8');
   }
@@ -570,14 +587,46 @@ export class ProjectWorkspace {
       );
     }
     await assertNotSymlink(target);
+    await assertInsideRealRoot(this.dir, target);
     await mkdir(dirname(target), { recursive: true });
     await moveEntry(source, target);
   }
 
-  async remove(relPath: string): Promise<void> {
+  /**
+   * Describe what deleting a path would remove.
+   *
+   * `rm -r` on a directory takes everything under it, and the caller only ever named the
+   * directory. Reporting the contents first is what turns an accidental "delete the folder"
+   * from a silent sweep of twenty files into a decision someone can make.
+   */
+  async describeDeletion(relPath: string): Promise<{ isDirectory: boolean; files: string[] }> {
     const path = safeJoin(this.dir, relPath);
     if (!existsSync(path)) {
       throw new ToolError(`cannot delete ${relPath}: no such file`);
+    }
+    const info = await stat(path);
+    if (!info.isDirectory()) return { isDirectory: false, files: [normalizeRelPath(relPath)] };
+
+    const prefix = `${normalizeRelPath(relPath)}/`;
+    return {
+      isDirectory: true,
+      files: this.listFiles().filter((file) => file.startsWith(prefix)),
+    };
+  }
+
+  async remove(relPath: string, options: { recursive?: boolean } = {}): Promise<void> {
+    const path = safeJoin(this.dir, relPath);
+    if (!existsSync(path)) {
+      throw new ToolError(`cannot delete ${relPath}: no such file`);
+    }
+    await assertInsideRealRoot(this.dir, path);
+
+    const info = await stat(path);
+    if (info.isDirectory() && options.recursive !== true) {
+      throw new ToolError(
+        `${relPath} is a directory, not a file`,
+        'Pass recursive=true to delete it and everything inside it.',
+      );
     }
     await rm(path, { recursive: true, force: true });
   }

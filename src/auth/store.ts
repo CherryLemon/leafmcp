@@ -78,14 +78,24 @@ interface StoreShape {
   revoked: Record<string, number>;
 }
 
-const EMPTY: StoreShape = { clients: {}, codes: {}, tokens: {}, revoked: {} };
+/**
+ * A fresh, empty store.
+ *
+ * A function rather than a shared constant: `{ ...EMPTY }` copies only the top level, so a
+ * constant would leave every instance pointing at the *same* nested `clients`, `tokens` and
+ * `revoked` objects. Two stores would then silently share state, and a store whose file does
+ * not exist yet would go on mutating the module-level object.
+ */
+function emptyStore(): StoreShape {
+  return { clients: {}, codes: {}, tokens: {}, revoked: {} };
+}
 
 export const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000; // 1h
 export const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30d
 export const AUTH_CODE_TTL_MS = 5 * 60 * 1000; // 5m
 
 export class OAuthStore {
-  private data: StoreShape = { ...EMPTY };
+  private data: StoreShape = emptyStore();
   private loaded = false;
   private writeChain: Promise<void> = Promise.resolve();
 
@@ -105,7 +115,7 @@ export class OAuthStore {
       }
     } catch (error) {
       log.warn(`could not read the OAuth store, starting empty: ${String(error)}`);
-      this.data = { ...EMPTY };
+      this.data = emptyStore();
     }
     this.loaded = true;
     this.prune();
@@ -185,6 +195,9 @@ export class OAuthStore {
 
   async putToken(record: TokenRecord): Promise<void> {
     await this.load();
+    // Long-running deployments that refresh often and rarely re-authorize otherwise keep
+    // expired rows forever: pruning used to happen only when a code was issued.
+    this.prune();
     this.data.tokens[record.token] = record;
     await this.persist();
   }
@@ -192,6 +205,41 @@ export class OAuthStore {
   /** Synchronous on purpose: callers use it inside a critical section. */
   isGrantRevoked(family: string): boolean {
     return this.data.revoked[family] !== undefined;
+  }
+
+  /**
+   * Drop registrations that never turned into anything.
+   *
+   * Registration needs no credentials, so the table would otherwise only ever grow, and a
+   * full table blocks every new client until an operator edits a JSON file by hand.
+   *
+   * A client is only reclaimable when it holds no live token *and* has no authorization
+   * still in progress: an unexpired code means somebody is in the middle of consenting, and
+   * removing the registration underneath them would break a flow that is about to succeed.
+   * Reclaiming is safe because a client that loses its registration can simply register
+   * again — nothing durable is lost.
+   */
+  async reclaimIdleClients(olderThanMs: number): Promise<number> {
+    await this.load();
+    const now = Date.now();
+
+    const busy = new Set<string>();
+    for (const record of Object.values(this.data.tokens)) {
+      if (record.expires_at > now) busy.add(record.client_id);
+    }
+    for (const code of Object.values(this.data.codes)) {
+      if (code.expires_at > now) busy.add(code.client_id);
+    }
+
+    let removed = 0;
+    for (const [id, client] of Object.entries(this.data.clients)) {
+      if (now - client.created_at < olderThanMs) continue;
+      if (busy.has(id)) continue;
+      delete this.data.clients[id];
+      removed += 1;
+    }
+    if (removed > 0) await this.persist();
+    return removed;
   }
 
   async getToken(token: string): Promise<TokenRecord | undefined> {

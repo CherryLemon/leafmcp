@@ -20,7 +20,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 import { loadConfig, type AppConfig } from './config.js';
-import { OAuthProvider } from './auth/provider.js';
+import { OAuthProvider, validateRedirectPatterns } from './auth/provider.js';
 import { OAuthStore } from './auth/store.js';
 import { ProjectRegistry, WorkspaceManager } from './overleaf/registry.js';
 import { OverleafSession } from './overleaf/session.js';
@@ -61,6 +61,10 @@ function validate(config: AppConfig, transport: 'http' | 'stdio'): string[] {
         'credential and must not travel over plain HTTP except to localhost.',
     );
   }
+
+  // Validated here rather than at provider construction, so `--check` reports it as a
+  // configuration problem instead of the process dying with a stack trace.
+  problems.push(...validateRedirectPatterns(config.auth.oauth.extraRedirectPatterns));
 
   if (transport === 'http') {
     if (config.auth.mode === 'oauth' && !process.env.MCP_OAUTH_PASSWORD) {
@@ -125,10 +129,8 @@ async function runHttp(config: AppConfig): Promise<void> {
     issuer: config.auth.oauth.issuer,
     resourceUrl: `${config.publicUrl}/mcp`,
     password: process.env.MCP_OAUTH_PASSWORD ?? '',
-    extraRedirectPatterns: (process.env.MCP_OAUTH_REDIRECT_ALLOWLIST ?? '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean),
+    extraRedirectUrls: config.auth.oauth.extraRedirectUrls,
+    extraRedirectPatterns: config.auth.oauth.extraRedirectPatterns,
     staticTokens: config.auth.tokens,
     oauthEnabled: config.auth.mode === 'oauth',
   });

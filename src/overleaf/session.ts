@@ -21,17 +21,27 @@ import type { OverleafCreds } from '../config.js';
 import { ToolError, errorMessage } from '../util/errors.js';
 import { log } from '../util/logger.js';
 
-/** Heuristics for "the cookie died", kept narrow so we never retry a real 404 forever. */
+/**
+ * Recognise "the cookie died".
+ *
+ * Deliberately phrase-based rather than a bare `login` substring: a false positive tears down
+ * a working session and retries a call that had failed for an unrelated reason, which turns a
+ * clear error into a confusing one. The Overleaf client's own wording is stable enough to
+ * match on — "Authentication required. Session may have expired."
+ */
+const AUTH_FAILURE_PATTERNS = [
+  /\b(401|403)\b/,
+  /authentication required/,
+  /session (may have )?expired/,
+  /not (logged in|authenticated)/,
+  /unauthori[sz]ed/,
+  /forbidden/,
+  /invalid (session|cookie|csrf)/,
+];
+
 function looksLikeAuthFailure(error: unknown): boolean {
   const text = errorMessage(error).toLowerCase();
-  return (
-    /\b(401|403)\b/.test(text) ||
-    text.includes('not logged in') ||
-    text.includes('unauthorized') ||
-    text.includes('forbidden') ||
-    text.includes('session expired') ||
-    text.includes('login')
-  );
+  return AUTH_FAILURE_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 export class OverleafSession {
@@ -97,7 +107,14 @@ export class OverleafSession {
     return this.inflight;
   }
 
-  /** Run an operation, rebuilding the client once if the first attempt looks like an auth failure. */
+  /**
+   * Run an operation, rebuilding the client once if the first attempt looks like an auth failure.
+   *
+   * The retry re-runs the whole callback, so it is only safe for operations that are
+   * idempotent when repeated: reads obviously are, and so are the writes used here — uploading
+   * a file and deleting a path both converge on the same state. Anything with a side effect
+   * that accumulates must not be routed through this.
+   */
   async run<T>(operation: (client: OverleafClient) => Promise<T>): Promise<T> {
     const client = await this.get();
     try {
@@ -105,7 +122,11 @@ export class OverleafSession {
     } catch (error) {
       if (!looksLikeAuthFailure(error)) throw error;
       log.warn(`overleaf call failed, rebuilding session and retrying once: ${errorMessage(error)}`);
-      this.client = null;
+
+      // Only discard the session this call was using. Clearing unconditionally would throw
+      // away a session another call had already rebuilt, so a burst of expiries would keep
+      // logging itself out.
+      if (this.client === client) this.client = null;
       const fresh = await this.get();
       return operation(fresh);
     }

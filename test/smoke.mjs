@@ -1408,6 +1408,231 @@ try {
   check('a pull over unexplained local files is refused', orphanRefused);
   check('the unexplained files are untouched', existsSync(join(orphanWork, 'work.tex')));
 
+  // ── regression: the rate limiter is bounded and cannot be reset ───────────
+  section('Regression — the rate limiter is bounded');
+
+  const { rateLimit } = await import('../dist/util/ratelimit.js');
+
+  // A full table must throttle new arrivals, not evict existing buckets: evicting is what
+  // lets an attacker rotate addresses to erase the record of their own abuse.
+  const limiter = rateLimit({ windowMs: 60_000, max: 2, maxKeys: 3, overflowMax: 1 });
+  const attemptRateLimited = (ip) => {
+    const res = {
+      statusCode: 200,
+      headers: {},
+      set(k, v) { this.headers[k] = v; return this; },
+      status(c) { this.statusCode = c; return this; },
+      json() { return this; },
+    };
+    let passed = false;
+    limiter({ ip, socket: {} }, res, () => { passed = true; });
+    return { status: res.statusCode, passed, headers: res.headers };
+  };
+
+  check('a client gets its allowance', attemptRateLimited('10.0.0.1').passed && attemptRateLimited('10.0.0.1').passed);
+  check('then it is throttled', attemptRateLimited('10.0.0.1').status === 429);
+  attemptRateLimited('10.0.0.2');
+  attemptRateLimited('10.0.0.3');
+  check('the table is now full', true);
+
+  // New addresses share one overflow budget instead of displacing the existing entries.
+  const overflowFirst = attemptRateLimited('10.9.9.9');
+  check('an unknown address is admitted once from the overflow budget', overflowFirst.passed);
+  check('the overflow budget is also finite', attemptRateLimited('10.8.8.8').status === 429);
+  check(
+    'the earlier client is still throttled, so its bucket was not evicted',
+    attemptRateLimited('10.0.0.1').status === 429,
+  );
+  check('throttling reports when to retry', typeof attemptRateLimited('10.0.0.1').headers['Retry-After'] === 'string');
+
+  // ── regression: registration reclaims abandoned clients ───────────────────
+  section('Regression — a full client table reclaims abandoned registrations');
+
+  const seedStore = new OAuthStore(join(dataDir, 'seed-probe.json'));
+  const seedProvider = new OAuthProvider({
+    store: seedStore, issuer: config.auth.oauth.issuer, resourceUrl: `${config.publicUrl}/mcp`,
+    password: PASS, oauthEnabled: true,
+  });
+  const seed = async (count, { old, withToken }) => {
+    for (let i = 0; i < count; i += 1) {
+      await seedStore.putClient({
+        client_id: `seed_${old ? 'old' : 'new'}_${i}`,
+        redirect_uris: [CLAUDE_CALLBACK],
+        grant_types: ['authorization_code'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'none',
+        created_at: old ? 0 : Date.now(),
+      });
+    }
+    if (withToken) {
+      await seedStore.putToken({
+        token: 'live-token', kind: 'access', client_id: 'seed_old_0', family: 'g',
+        expires_at: Date.now() + 600_000, created_at: Date.now(), status: 'active',
+      });
+    }
+  };
+
+  // A full table of registrations that never became anything: reclamation has to make room.
+  await seed(200, { old: true, withToken: false });
+  let reclaimWorked = true;
+  try {
+    await seedProvider.registerClient({ redirect_uris: [CLAUDE_CALLBACK] });
+  } catch (error) {
+    reclaimWorked = false;
+    check('registration succeeded by reclaiming', false, String(error.message));
+  }
+  check('registration succeeds by reclaiming idle clients', reclaimWorked);
+  check('abandoned registrations were dropped', (await seedStore.listClients()).length < 200);
+
+  // Now a full table where a live token makes a client un-reclaimable.
+  const busyStore = new OAuthStore(join(dataDir, 'busy-probe.json'));
+  const busyProvider = new OAuthProvider({
+    store: busyStore, issuer: config.auth.oauth.issuer, resourceUrl: `${config.publicUrl}/mcp`,
+    password: PASS, oauthEnabled: true,
+  });
+  for (let i = 0; i < 200; i += 1) {
+    await busyStore.putClient({
+      client_id: `busy_${i}`, redirect_uris: [CLAUDE_CALLBACK],
+      grant_types: ['authorization_code'], response_types: ['code'],
+      token_endpoint_auth_method: 'none', created_at: 0,
+    });
+    await busyStore.putToken({
+      token: `busy-token-${i}`, kind: 'access', client_id: `busy_${i}`, family: `g${i}`,
+      expires_at: Date.now() + 600_000, created_at: Date.now(), status: 'active',
+    });
+  }
+  let busyRefused = false;
+  try {
+    await busyProvider.registerClient({ redirect_uris: [CLAUDE_CALLBACK] });
+  } catch (error) {
+    busyRefused = /maximum of 200/.test(String(error.message));
+  }
+  check('a table of clients holding live tokens is not reclaimed', busyRefused);
+  check('those clients are untouched', (await busyStore.listClients()).length === 200);
+
+  // ── regression: search budgets ────────────────────────────────────────────
+  section('Regression — the search process has its own budgets');
+
+  const budgetRoot = join(dataDir, 'projects', 'searchprobe');
+  const wsSearch = new ProjectWorkspace(dataDir, 'searchprobe', 'Search Probe', { maxFileBytes: 1024 * 1024 });
+  await wsSearch.ensure();
+  await wsSearch.write('small.tex', 'needle here\n');
+  await wsSearch.write('big.tex', `needle ${'x'.repeat(5000)}\n`);
+
+  const skippedBig = await searchIsolated({
+    root: budgetRoot, files: ['small.tex', 'big.tex'], skip: [], pattern: 'needle',
+    isRegex: false, caseSensitive: false, maxResults: 10, lineCap: 4000, timeoutMs: 8000,
+    maxFileBytes: 1000, maxTotalBytes: 1_000_000,
+  });
+  check('a file over the per-file budget is skipped', skippedBig.hits.length === 1, JSON.stringify(skippedBig.hits));
+  check('the small file was still searched', skippedBig.hits[0]?.path === 'small.tex');
+
+  const totalBudget = await searchIsolated({
+    root: budgetRoot, files: ['big.tex', 'small.tex'], skip: [], pattern: 'needle',
+    isRegex: false, caseSensitive: false, maxResults: 10, lineCap: 4000, timeoutMs: 8000,
+    maxFileBytes: 1024 * 1024, maxTotalBytes: 100,
+  });
+  check('the total byte budget stops the scan', totalBudget.budgetExhausted === true, JSON.stringify(totalBudget));
+
+  // ── regression: deleting a directory is a separate decision ───────────────
+  section('Regression — deleting a directory is not a single-file delete');
+
+  const wsDel = new ProjectWorkspace(dataDir, 'delprobe', 'Delete Probe', { maxFileBytes: 1024 * 1024 });
+  await wsDel.ensure();
+  await wsDel.write('chapter/one.tex', 'one\n');
+  await wsDel.write('chapter/two.tex', 'two\n');
+  await wsDel.commit('edit: seed');
+
+  const described = await wsDel.describeDeletion('chapter');
+  check('the directory is recognised', described.isDirectory === true);
+  check('its contents are listed before anything happens', described.files.length === 2, JSON.stringify(described.files));
+
+  let dirRefused = false;
+  try {
+    await wsDel.remove('chapter');
+  } catch (error) {
+    dirRefused = /directory/.test(String(error.message));
+  }
+  check('removing a directory without recursive is refused', dirRefused);
+  check('nothing was deleted', existsSync(join(wsDel.dir, 'chapter', 'one.tex')));
+
+  await wsDel.remove('chapter', { recursive: true });
+  check('recursive removal works when asked for', !existsSync(join(wsDel.dir, 'chapter')));
+
+  // ── regression: a symlinked directory cannot smuggle a write outside ──────
+  section('Regression — writes cannot escape through a symlinked directory');
+
+  const { symlinkSync } = await import('node:fs');
+  const escapeRoot = join(dataDir, 'escape');
+  const outsideDir = join(dataDir, 'outside-the-project');
+  mkdirSync(outsideDir, { recursive: true });
+
+  const wsLink = new ProjectWorkspace(escapeRoot, 'linkprobe', 'Link Probe', { maxFileBytes: 1024 * 1024 });
+  await wsLink.ensure();
+  symlinkSync(outsideDir, join(wsLink.dir, 'link'), 'dir');
+
+  let linkWriteRefused = false;
+  try {
+    await wsLink.write('link/escape.tex', 'should not land outside\n');
+  } catch {
+    linkWriteRefused = true;
+  }
+  check('a write through a symlinked directory is refused', linkWriteRefused);
+  check('nothing appeared outside the project', !existsSync(join(outsideDir, 'escape.tex')));
+
+  let moveEscaped = false;
+  try {
+    await wsLink.write('legit.tex', 'content\n');
+    await wsLink.movePath('legit.tex', 'link/moved.tex');
+  } catch {
+    moveEscaped = true;
+  }
+  check('a move through a symlinked directory is refused', moveEscaped);
+  check('the source is still in place', existsSync(join(wsLink.dir, 'legit.tex')));
+
+  // ── regression: redaction covers encoded variants ─────────────────────────
+  section('Regression — redaction covers encoded forms and updates');
+
+  const { registerSecret, redact } = await import('../dist/util/errors.js');
+  registerSecret('s3cret%2Dvalue%2Dwith%2Dencoding');
+  check('the encoded form is scrubbed', !redact('token=s3cret%2Dvalue%2Dwith%2Dencoding').includes('s3cret%2Dvalue'));
+  check('the decoded form is scrubbed too', !redact('saw s3cret-value-with-encoding in a log').includes('s3cret-value-with-encoding'));
+  check('a freshly registered secret takes effect immediately', !redact('value is rotated-secret-9999').includes('rotated-secret-9999') === false);
+  registerSecret('rotated-secret-9999');
+  check('after registration it is scrubbed', !redact('value is rotated-secret-9999').includes('rotated-secret-9999'));
+  check('short values are not registered', redact('abc') === 'abc');
+
+  // ── regression: dot files are discoverable, git internals are not ─────────
+  section('Regression — listing and reading agree about hidden files');
+
+  const wsDot = new ProjectWorkspace(dataDir, 'dotprobe', 'Dot Probe', { maxFileBytes: 1024 * 1024 });
+  await wsDot.ensure();
+  await wsDot.write('.latexmkrc', "$pdf_mode = 1;\n");
+  check('a dot file is listed', wsDot.listFiles().includes('.latexmkrc'), JSON.stringify(wsDot.listFiles()));
+  check('and can be read', (await wsDot.read('.latexmkrc')).includes('pdf_mode'));
+  check('git internals are still unreachable', !wsDot.listFiles().some((f) => f.toLowerCase().startsWith('.git')));
+
+  // ── regression: callback patterns are validated before use ────────────────
+  section('Regression — callback patterns must be anchored and literal');
+
+  const { validateRedirectPatterns } = await import('../dist/auth/provider.js');
+  check('an unanchored pattern is rejected', validateRedirectPatterns(['https://x.example/cb']).length > 0);
+  check('an unescaped dot is rejected', validateRedirectPatterns(['^https://x.example/cb$']).length > 0);
+  check('an invalid expression is rejected', validateRedirectPatterns(['[invalid(']).length > 0);
+  check('a correct pattern passes', validateRedirectPatterns(['^https://x\\.example/cb$']).length === 0);
+
+  const exactProvider = new OAuthProvider({
+    store, issuer: config.auth.oauth.issuer, resourceUrl: `${config.publicUrl}/mcp`,
+    password: PASS, oauthEnabled: true,
+    extraRedirectUrls: ['https://mcp.example.com/cb'],
+  });
+  check('an exact URL is accepted', exactProvider.isRedirectAllowed('https://mcp.example.com/cb'));
+  check('a hostname variant is not', !exactProvider.isRedirectAllowed('https://mcpXexample.com/cb'));
+  check(
+    'a URL carrying the real callback as a parameter is not',
+    !exactProvider.isRedirectAllowed('https://evil.example/?next=https://mcp.example.com/cb'),
+  );
+
   // ── regression: the token store is not world-readable ──────────────────────
   section('Regression — OAuth state file permissions');
 

@@ -27,6 +27,8 @@ import { log } from '../util/logger.js';
  * token operation.
  */
 const MAX_REGISTERED_CLIENTS = 200;
+/** How long a registration must have existed, untouched, before it can be reclaimed. */
+const IDLE_CLIENT_MS = 15 * 60 * 1000;
 const MAX_CLIENT_NAME_LENGTH = 200;
 const MAX_SCOPE_LENGTH = 500;
 const MAX_REDIRECT_URIS = 10;
@@ -90,7 +92,19 @@ export interface OAuthProviderOptions {
   resourceUrl: string;
   /** Operator passphrase gating the consent screen. */
   password: string;
-  /** Extra redirect URI patterns (regex source strings) from configuration. */
+  /**
+   * Extra callback URLs, matched exactly.
+   *
+   * Preferred over patterns: a URL compared as a string cannot accidentally accept a
+   * neighbouring host, whereas a regular expression built from a URL treats `.` as "any
+   * character", so `https://mcp.example.com` would also match `https://mcpXexample.com`.
+   */
+  extraRedirectUrls?: string[];
+  /**
+   * Extra callback patterns, as anchored regular expressions.
+   *
+   * Validated at startup; see `validateRedirectPatterns`.
+   */
   extraRedirectPatterns?: string[];
   /** Static bearer tokens for local/CLI clients; always granted full scope. */
   staticTokens?: string[];
@@ -104,18 +118,48 @@ export interface OAuthProviderOptions {
   oauthEnabled: boolean;
 }
 
+/**
+ * Reject callback patterns that are not anchored.
+ *
+ * An unanchored pattern is matched anywhere in the string, so `claude.ai/api/mcp/auth_callback`
+ * would accept `https://evil.example/?next=https://claude.ai/api/mcp/auth_callback` — a URL
+ * that carries the real callback as a parameter. Requiring `^…$` is the cheapest way to make
+ * that class of mistake impossible to configure.
+ */
+export function validateRedirectPatterns(patterns: string[]): string[] {
+  const problems: string[] = [];
+  for (const pattern of patterns) {
+    try {
+      // eslint-disable-next-line no-new
+      new RegExp(pattern);
+    } catch (error) {
+      problems.push(`not a valid regular expression (${error instanceof Error ? error.message : String(error)}): ${pattern}`);
+      continue;
+    }
+    if (!pattern.startsWith('^') || !pattern.endsWith('$')) {
+      problems.push(`must be anchored with ^ and $ so it cannot match part of a longer URL: ${pattern}`);
+    }
+    if (/(?<!\\)\./.test(pattern.replace(/\\\./g, ''))) {
+      problems.push(`contains an unescaped "." (matches any character); write \\. for a literal dot: ${pattern}`);
+    }
+  }
+  return problems;
+}
+
 export class OAuthProvider {
   private readonly patterns: RegExp[];
+  private readonly exactUrls: Set<string>;
 
   constructor(private readonly options: OAuthProviderOptions) {
     this.patterns = [
       ...BUILTIN_REDIRECT_PATTERNS,
       ...(options.extraRedirectPatterns ?? []).map((source) => new RegExp(source)),
     ];
+    this.exactUrls = new Set(options.extraRedirectUrls ?? []);
   }
 
   isRedirectAllowed(uri: string): boolean {
-    return this.patterns.some((pattern) => pattern.test(uri));
+    return this.exactUrls.has(uri) || this.patterns.some((pattern) => pattern.test(uri));
   }
 
   private checkResource(resource: string | undefined): void {
@@ -202,12 +246,19 @@ export class OAuthProvider {
       );
     }
 
-    const existing = await this.options.store.listClients();
+    let existing = await this.options.store.listClients();
+    if (existing.length >= MAX_REGISTERED_CLIENTS) {
+      // Make room from registrations that never became anything, rather than refusing a
+      // legitimate client because abandoned ones are still on the books.
+      const reclaimed = await this.options.store.reclaimIdleClients(IDLE_CLIENT_MS);
+      if (reclaimed > 0) log.info(`reclaimed ${reclaimed} idle OAuth client registration(s)`);
+      existing = await this.options.store.listClients();
+    }
     if (existing.length >= MAX_REGISTERED_CLIENTS) {
       throw new OAuthError(
         'invalid_client_metadata',
-        `this server already holds the maximum of ${MAX_REGISTERED_CLIENTS} registered clients; ` +
-          'remove unused ones from the OAuth state file before registering more',
+        `this server already holds the maximum of ${MAX_REGISTERED_CLIENTS} registered clients, ` +
+          'all of them in use; remove unused entries from the OAuth state file before registering more',
         403,
       );
     }

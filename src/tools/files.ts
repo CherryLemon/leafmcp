@@ -26,6 +26,14 @@ const SEARCH_TIMEOUT_MS = 15_000;
 /** Only this much of a line is ever handed to a model-supplied pattern. */
 const MAX_LINE_SCAN = 4_000;
 
+/**
+ * Ceiling on total bytes one search may read.
+ *
+ * The per-file limit is the same one the read tool applies; this bounds the sum, so a project
+ * full of medium-sized files cannot make a single search scan everything.
+ */
+const SEARCH_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+
 /** Read a slice of a file's lines, 1-based and inclusive, clamped to the file. */
 export function sliceLines(
   content: string,
@@ -177,6 +185,8 @@ export const fileTools = [
         maxResults: limit,
         lineCap: MAX_LINE_SCAN,
         timeoutMs: SEARCH_TIMEOUT_MS,
+        maxFileBytes: ctx.config.maxFileBytes,
+        maxTotalBytes: SEARCH_MAX_TOTAL_BYTES,
       });
 
       if (outcome.error) {
@@ -189,7 +199,10 @@ export const fileTools = [
       const note = outcome.timedOut
         ? `\n\n(stopped after ${SEARCH_TIMEOUT_MS / 1000}s: the pattern was too expensive to evaluate. ` +
           'Narrow it with glob or max_results, or search for a literal string instead.)'
-        : '';
+        : outcome.budgetExhausted
+          ? `\n\n(stopped after reading ${Math.round(SEARCH_MAX_TOTAL_BYTES / (1024 * 1024))} MB; ` +
+            'narrow the search with glob to cover the rest.)'
+          : '';
       if (outcome.hits.length === 0) {
         return `No matches for ${JSON.stringify(args.query)} in ${files.length} file(s).${note}`;
       }
@@ -305,6 +318,10 @@ export const fileTools = [
     inputSchema: {
       path: z.string().describe('Project-relative path of the file to delete.'),
       confirm: z.boolean().describe('Must be true. Confirms you intend to delete this file.'),
+      recursive: z
+        .boolean()
+        .optional()
+        .describe('Required to delete a directory and everything inside it.'),
       project: requiredProject,
     },
     async run(ctx, args) {
@@ -313,11 +330,27 @@ export const fileTools = [
         throw new ToolError('delete_file requires confirm=true', 'Ask the user before deleting files.');
       }
       const { project, workspace } = await requireProjectArg(ctx, args.project, 'delete_file');
-      await workspace.remove(args.path);
+
+      // A directory is refused on the first attempt, with its contents listed. Naming a folder
+      // and having twenty files disappear from Overleaf is not a confirmation anyone gave.
+      const target = await workspace.describeDeletion(args.path);
+      if (target.isDirectory && args.recursive !== true) {
+        const preview = target.files.slice(0, 20).map((file) => `  ${file}`).join('\n');
+        throw new ToolError(
+          `${normalizeRelPath(args.path)} is a directory holding ${target.files.length} file(s); nothing was deleted`,
+          `Pass recursive=true to remove all of them from Overleaf:\n${preview}` +
+            (target.files.length > 20 ? `\n  … and ${target.files.length - 20} more` : ''),
+        );
+      }
+
+      await workspace.remove(args.path, { recursive: args.recursive ?? false });
       const publish = await publishIfConfigured(ctx, workspace, {
         message: `delete ${normalizeRelPath(args.path)}`,
       });
-      return withPublish(`Deleted ${normalizeRelPath(args.path)} from "${project.name}" (${project.id}).${publish.note}`, publish);
+      const what = target.isDirectory
+        ? `${normalizeRelPath(args.path)} and its ${target.files.length} file(s)`
+        : normalizeRelPath(args.path);
+      return withPublish(`Deleted ${what} from "${project.name}" (${project.id}).${publish.note}`, publish);
     },
   }),
 

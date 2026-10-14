@@ -17,7 +17,7 @@
  * would fail in development while working in the built output.
  */
 
-import { readFileSync, realpathSync } from 'node:fs';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 export interface SearchJob {
@@ -30,6 +30,10 @@ export interface SearchJob {
   maxResults: number;
   /** Only this many characters per line are ever handed to the pattern. */
   lineCap: number;
+  /** Files larger than this are skipped rather than read into memory. */
+  maxFileBytes: number;
+  /** Stop once this many bytes have been read across all files. */
+  maxTotalBytes: number;
   /** Skip these; reading them as text is pointless. */
   skip: (path: string) => boolean;
 }
@@ -43,6 +47,8 @@ export interface SearchHit {
 export interface SearchResult {
   hits: SearchHit[];
   scanned: number;
+  /** True when the byte budget stopped the search early. */
+  budgetExhausted: boolean;
 }
 
 function escapeRegExp(value: string): string {
@@ -53,14 +59,26 @@ export function runSearch(job: SearchJob): SearchResult {
   const matcher = new RegExp(job.isRegex ? job.pattern : escapeRegExp(job.pattern), job.caseSensitive ? '' : 'i');
   const hits: SearchHit[] = [];
   let scanned = 0;
+  let bytesRead = 0;
+  let budgetExhausted = false;
 
   for (const file of job.files) {
     if (hits.length >= job.maxResults) break;
     if (job.skip(file)) continue;
 
+    // The parent's read tool enforces a size limit; this process reads files itself, so it
+    // has to enforce its own. Without it a single large asset could be pulled into memory
+    // once per search.
     let content: string;
     try {
+      const stats = statSync(`${job.root}/${file}`);
+      if (stats.size > job.maxFileBytes) continue;
+      if (bytesRead + stats.size > job.maxTotalBytes) {
+        budgetExhausted = true;
+        break;
+      }
       content = readFileSync(`${job.root}/${file}`, 'utf8');
+      bytesRead += stats.size;
     } catch {
       continue;
     }
@@ -77,7 +95,7 @@ export function runSearch(job: SearchJob): SearchResult {
     }
   }
 
-  return { hits, scanned };
+  return { hits, scanned, budgetExhausted };
 }
 
 async function main(): Promise<void> {

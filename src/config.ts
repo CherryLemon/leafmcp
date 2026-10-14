@@ -28,12 +28,10 @@ export interface AuthConfig {
   /** Only used when mode === 'oauth'. */
   oauth: {
     issuer: string;
-    /** Pre-registered client id/secret; if empty, dynamic client registration is enabled. */
-    clientId?: string;
-    clientSecret?: string;
-    /** Where the browser is sent to approve access. Defaults to issuer + /authorize. */
-    authorizationEndpoint?: string;
-    tokenEndpoint?: string;
+    /** Extra exact callback URLs to accept, on top of the built-in vendor list. */
+    extraRedirectUrls: string[];
+    /** Extra callback patterns, as anchored regular expressions. */
+    extraRedirectPatterns: string[];
   };
 }
 
@@ -166,10 +164,10 @@ export function loadConfig(): AppConfig {
       tokens: list('MCP_BEARER_TOKENS'),
       oauth: {
         issuer: (str('MCP_OAUTH_ISSUER') ?? publicUrl).replace(/\/+$/, ''),
-        clientId: str('MCP_OAUTH_CLIENT_ID'),
-        clientSecret: str('MCP_OAUTH_CLIENT_SECRET'),
-        authorizationEndpoint: str('MCP_OAUTH_AUTHORIZE_URL'),
-        tokenEndpoint: str('MCP_OAUTH_TOKEN_URL'),
+        // A list of exact URLs is the safer interface: a pattern is matched as a regular
+        // expression, so an unescaped dot in a hostname quietly widens what is accepted.
+        extraRedirectUrls: list('MCP_OAUTH_REDIRECT_URLS'),
+        extraRedirectPatterns: list('MCP_OAUTH_REDIRECT_ALLOWLIST'),
       },
     },
     overleaf: {

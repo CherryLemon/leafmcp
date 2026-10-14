@@ -31,14 +31,30 @@ export interface IsolatedSearchOptions {
   maxResults: number;
   lineCap: number;
   timeoutMs: number;
+  /** Mirrors the read tool's per-file limit. */
+  maxFileBytes: number;
+  /** Upper bound on total bytes read across the whole search. */
+  maxTotalBytes: number;
 }
 
 export interface IsolatedSearchResult {
   hits: SearchHit[];
   scanned: number;
   timedOut: boolean;
+  /** True when the byte budget stopped the scan early. */
+  budgetExhausted: boolean;
   error?: string;
 }
+
+/**
+ * How many searches may run at once.
+ *
+ * Each one is a process, and process count is the resource an unauthenticated caller could
+ * otherwise multiply through the tools. Searches on one project already serialise via the
+ * project lock; this bounds the total across projects.
+ */
+const MAX_CONCURRENT_SEARCHES = 4;
+let runningSearches = 0;
 
 /**
  * Locate the worker in both the built output and the TypeScript sources.
@@ -70,8 +86,21 @@ export function searchIsolated(options: IsolatedSearchOptions): Promise<Isolated
     caseSensitive: options.caseSensitive,
     maxResults: options.maxResults,
     lineCap: options.lineCap,
+    maxFileBytes: options.maxFileBytes,
+    maxTotalBytes: options.maxTotalBytes,
     skip: options.skip,
   };
+
+  if (runningSearches >= MAX_CONCURRENT_SEARCHES) {
+    return Promise.resolve({
+      hits: [],
+      scanned: 0,
+      timedOut: false,
+      budgetExhausted: false,
+      error: `too many searches are already running (limit ${MAX_CONCURRENT_SEARCHES}); try again in a moment`,
+    });
+  }
+  runningSearches += 1;
 
   return new Promise((resolvePromise) => {
     const child = spawn(process.execPath, [...args, file], {
@@ -95,6 +124,7 @@ export function searchIsolated(options: IsolatedSearchOptions): Promise<Isolated
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      runningSearches -= 1;
       resolvePromise(result);
     };
 
@@ -103,7 +133,7 @@ export function searchIsolated(options: IsolatedSearchOptions): Promise<Isolated
       log.warn(`search exceeded ${options.timeoutMs}ms and was terminated (pattern: ${options.pattern.slice(0, 80)})`);
       child.kill('SIGKILL');
       // Give the kill a moment to land, then answer regardless.
-      setTimeout(() => finish({ hits: [], scanned: 0, timedOut: true }), 250).unref();
+      setTimeout(() => finish({ hits: [], scanned: 0, timedOut: true, budgetExhausted: false }), 250).unref();
     }, options.timeoutMs);
 
     child.stdout.on('data', (chunk: Buffer) => {
@@ -114,22 +144,28 @@ export function searchIsolated(options: IsolatedSearchOptions): Promise<Isolated
     });
 
     child.on('error', (error) => {
-      finish({ hits: [], scanned: 0, timedOut, error: error.message });
+      finish({ hits: [], scanned: 0, timedOut, budgetExhausted: false, error: error.message });
     });
 
     child.on('close', () => {
       if (timedOut) {
-        finish({ hits: [], scanned: 0, timedOut: true });
+        finish({ hits: [], scanned: 0, timedOut: true, budgetExhausted: false });
         return;
       }
       try {
-        const parsed = JSON.parse(stdout) as { hits: SearchHit[]; scanned: number };
-        finish({ hits: parsed.hits ?? [], scanned: parsed.scanned ?? 0, timedOut: false });
+        const parsed = JSON.parse(stdout) as { hits: SearchHit[]; scanned: number; budgetExhausted?: boolean };
+        finish({
+          hits: parsed.hits ?? [],
+          scanned: parsed.scanned ?? 0,
+          timedOut: false,
+          budgetExhausted: parsed.budgetExhausted ?? false,
+        });
       } catch {
         finish({
           hits: [],
           scanned: 0,
           timedOut: false,
+          budgetExhausted: false,
           error: stderr.trim() || 'the search process returned no usable result',
         });
       }

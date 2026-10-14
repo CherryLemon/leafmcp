@@ -1,7 +1,7 @@
 /** Path handling for tool arguments, which are attacker-influenced (the model writes them). */
 
-import { isAbsolute, relative, resolve, sep } from 'node:path';
-import { lstat } from 'node:fs/promises';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { lstat, realpath } from 'node:fs/promises';
 import { ToolError } from './errors.js';
 
 /**
@@ -100,6 +100,33 @@ export async function assertNotSymlink(path: string): Promise<void> {
   } catch (error) {
     if (error instanceof ToolError) throw error;
     // ENOENT is the normal case: the file does not exist yet.
+  }
+}
+
+/**
+ * Verify that a target's parent directory really sits inside the root.
+ *
+ * `safeJoin` reasons about the string, which cannot see a symbolic link: if any ancestor of
+ * the target is a link pointing elsewhere, the path text still looks contained while the
+ * write lands outside. Resolving the parent covers the whole chain at once.
+ *
+ * This cannot eliminate the window between the check and the write — only opening with
+ * `O_NOFOLLOW` on every component would — but it closes the case where a link was placed in
+ * the tree and simply left there.
+ */
+export async function assertInsideRealRoot(root: string, target: string): Promise<void> {
+  const resolvedRoot = await realpath(root).catch(() => resolve(root));
+  const parent = dirname(target);
+
+  // A missing parent is normal: it is about to be created, and inside the root by then.
+  const resolvedParent = await realpath(parent).catch(() => null);
+  if (resolvedParent === null) return;
+
+  if (resolvedParent !== resolvedRoot && !resolvedParent.startsWith(resolvedRoot + sep)) {
+    throw new ToolError(
+      `refusing to write to "${target}": its directory resolves outside the project`,
+      'Something in the project directory is a symbolic link pointing elsewhere.',
+    );
   }
 }
 
