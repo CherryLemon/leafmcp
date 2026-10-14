@@ -6,7 +6,7 @@ import { ToolError } from '../util/errors.js';
 import type { ActiveProject } from '../overleaf/registry.js';
 import { EDIT_COMMIT_PREFIX } from '../overleaf/workspace.js';
 import type { PendingChange, ProjectWorkspace } from '../overleaf/workspace.js';
-import type { ToolContext } from './types.js';
+import type { ToolContext, ToolResult } from './types.js';
 import { assertWritable } from './types.js';
 
 /**
@@ -102,39 +102,68 @@ export interface SaveOptions {
   message: string;
 }
 
+export interface PublishReport {
+  /** Text to append to the tool's own message. */
+  note: string;
+  /** False when something did not reach Overleaf, so the caller can mark the result failed. */
+  ok: boolean;
+}
+
 /**
  * Publish the mirror to Overleaf when auto-push is on, and describe what happened.
  *
  * Auto-push is the default because the whole point of the bridge is that the user sees the
- * change in their browser immediately. When it is off (or the push fails) the text says so
- * explicitly, so the model never reports success it did not achieve.
+ * change in their browser immediately.
+ *
+ * The returned `ok` flag is what stops a partial failure from being read as success. A
+ * warning buried in a successful-looking response is easy for a model to summarise away as
+ * "done" — and the user then believes their paper was updated when the upload failed.
  */
 export async function publishIfConfigured(
   ctx: ToolContext,
   workspace: ProjectWorkspace,
   options: SaveOptions,
-): Promise<string> {
+): Promise<PublishReport> {
   await workspace.commit(`${EDIT_COMMIT_PREFIX} ${options.message}`);
 
   if (!ctx.config.autoPush) {
-    return `\n\nSaved to the local mirror. Changes are NOT yet on Overleaf — call publish_changes to send them.`;
+    return {
+      note: '\n\nSaved to the local mirror. Changes are NOT yet on Overleaf — call publish_changes to send them.',
+      ok: true,
+    };
   }
 
   const outcome = await ctx.session.run((client) => workspace.push(client));
-  if (outcome.clean) return '\n\nSynced with Overleaf (nothing to send).';
+  if (outcome.clean) return { note: '\n\nSynced with Overleaf (nothing to send).', ok: true };
 
   const parts: string[] = [];
   const sent = outcome.uploaded.length + outcome.deleted.length;
   if (sent > 0) {
-    parts.push(`\n\nPublished to Overleaf: ${outcome.uploaded.length} file(s) updated${outcome.deleted.length > 0 ? `, ${outcome.deleted.length} deleted` : ''}.`);
+    parts.push(
+      `\n\nPublished to Overleaf: ${outcome.uploaded.length} file(s) updated` +
+        `${outcome.deleted.length > 0 ? `, ${outcome.deleted.length} deleted` : ''}.`,
+    );
   }
   if (outcome.failed.length > 0) {
     parts.push(
-      `\n\nWARNING — ${outcome.failed.length} change(s) could not be published and are still pending locally:\n` +
-        outcome.failed.map((f) => `  - ${f.path}: ${f.reason}`).join('\n'),
+      `\n\nNOT PUBLISHED — ${outcome.failed.length} change(s) are still only local:\n` +
+        outcome.failed.map((f) => `  - ${f.path}: ${f.reason}`).join('\n') +
+        (outcome.deletionsDeferred
+          ? '\nDeletions were held back so nothing was removed from Overleaf.'
+          : ''),
     );
   }
-  return parts.join('');
+  return { note: parts.join(''), ok: outcome.failed.length === 0 };
+}
+
+/**
+ * Build the tool's result from its message plus the publish report.
+ *
+ * Centralised so every mutating tool marks a partial publish as an error rather than leaving
+ * it as a sentence inside an otherwise successful response.
+ */
+export function withPublish(text: string, publish: PublishReport): ToolResult {
+  return publish.ok ? { text } : { text, isError: true };
 }
 
 export function formatChanges(changes: PendingChange[]): string {

@@ -291,7 +291,7 @@ those hints to decide when to ask for confirmation.
 | `read_files` | Read several files in one call. |
 | `search_project` | Search all text files by substring or regular expression. |
 | `file_outline` | Sections, labels, citations, includes and environments of one `.tex` file. |
-| `edit_file` | **Preferred.** Replace an exact snippet; ambiguous matches are refused. |
+| `edit_file` | **Preferred.** Replace an exact snippet; ambiguous matches are refused, and `expected_hash` refuses the edit if the file moved on since it was read. |
 | `write_file` | Write a whole file, creating it if needed. |
 | `delete_file` | Delete a file (requires explicit `confirm=true`). |
 | `rename_file` | Rename or move a file. |
@@ -321,6 +321,9 @@ those hints to decide when to ask for confirmation.
 - **Mirror plus git.** Each project has a locally cached, git-versioned mirror. The ref
   `refs/overleaf/pushed` records what Overleaf already has, so "what would a push change?" is a
   `git diff` rather than bookkeeping we could get wrong.
+- **One writer per project.** Every mutating tool runs under that project's lock, so the whole refresh → read → write → commit → publish sequence is atomic with respect to other clients. Without it, two edits arriving together both read the same base and the second discards the first. Different projects stay fully concurrent. This serialises within one process; two server instances must not share a data directory.
+- **A partial publish is an error, not a footnote.** If any file fails to reach Overleaf, the tool result is flagged as an error, because a warning inside an otherwise successful response is easy for a model to summarise away as "done" — and the user then believes their paper was updated.
+- **Edits can be pinned to a version.** `read_file` reports a `sha256:` prefix and `edit_file` accepts it as `expected_hash`, so an edit written against text that has since changed is refused rather than applied. Overleaf offers no atomic conditional write, so this cannot close the race between the check and the upload — but it turns the common case, "the user edited this after the model read it", into a conflict someone has to look at.
 - **Undo is real.** Every tool edit is a commit, and `undo_last_edit` uses `git revert`, so an
   undo is itself undoable. It deliberately refuses to reverse a *reload from Overleaf* — that
   would push a stale copy over whatever you changed in the browser.
@@ -398,6 +401,10 @@ is **fixed and covered by a regression test** (`npm test`, the `Regression` sect
 | Medium | `search_project` compiled a model-supplied regex and ran it per line on the event loop, so catastrophic backtracking hung the whole server. | Nested-quantifier patterns rejected, plus a per-line cap and a time budget. |
 | Medium | `edit_file` passed replacement text through `String.replace`, which expands `$$`, `$&` and `$1`. Writing `$$E = mc^2$$` produced `$E = mc^2$` — display math silently destroyed by the one tool whose job is editing LaTeX. The two replacement branches also disagreed. | A function replacer makes the text literal in both branches. |
 | Medium | The ReDoS guard was a heuristic for nested quantifiers, and `(a|aa)+$` walked past it. Measured: 36 characters took ~6 seconds and 40 never finished, against a 4,000-character line cap — so one line of one file could wedge every request. | Regex evaluation moved into a killable child process with a hard deadline, which is the only thing that stops a match already running. |
+| Medium | Dynamic client registration is unauthenticated by design, and nothing bounded it: `client_name` had no length limit, there was no cap on the number of clients, and the endpoint accepted the global 4 MB body. Each stored client is rewritten in full on every token operation, so this was an anonymous way to make the server do unbounded work. | Per-field length limits, a cap on registered clients, and a 16 KB body limit for the OAuth routes (the MCP route keeps 4 MB because a `write_file` call carries a file). |
+| Medium | Project import had no limits. `pull` holds the whole archive in memory, so a project with a hundred thousand entries, one enormous entry, or a deeply nested path was enough to exhaust the process. | Entry count, per-entry and total extracted size, and path depth are all bounded; the declared size is checked before decompressing and the real size after, since a crafted archive can understate it. |
+| Medium | The consent screen could be framed and cached. It is the one page where a click decides whether a stranger gets write access to someone's papers. | CSP with `frame-ancestors 'none'` and `form-action 'self'`, plus `X-Frame-Options: DENY`, `Cache-Control: no-store`, a referrer policy and `nosniff`. There is no script on the page at all. |
+| Low | The Docker build used `npm install` while CI used `npm ci`, so an image could contain dependency versions no lockfile ever pinned. | Both stages use `npm ci`. |
 | Low | `use_project` had no read-only check and writes global state, so a read-only connection could retarget another client's edits. | Read-only check added. |
 | Low | `MCP_AUTH_MODE=none` granted anonymous write access. | Read-only by default; requires `OLMCP_ALLOW_ANONYMOUS_WRITE=true` to opt in. |
 | Low | Static tokens were compared in non-constant time; redaction missed custom cookie names; successful tool output bypassed redaction. | Constant-time comparison, runtime-registered secrets, output redacted too. |
@@ -469,7 +476,7 @@ src/
     search.ts             Spawns and supervises the isolated search
     search-worker.ts      Runs the pattern somewhere it can be killed
   transport/http.ts     Express app: MCP endpoint, OAuth, health check
-test/smoke.mjs          End-to-end suite (152 checks)
+test/smoke.mjs          End-to-end suite (179 checks)
 docker/                 Dockerfile, compose, Caddyfile
 ```
 

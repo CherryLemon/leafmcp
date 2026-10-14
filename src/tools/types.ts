@@ -12,15 +12,33 @@ import type { z } from 'zod';
 import type { AppConfig } from '../config.js';
 import type { ProjectRegistry, WorkspaceManager } from '../overleaf/registry.js';
 import type { OverleafSession } from '../overleaf/session.js';
+import type { KeyedMutex } from '../util/lock.js';
 
 export interface ToolContext {
   config: AppConfig;
   session: OverleafSession;
   registry: ProjectRegistry;
   workspaces: WorkspaceManager;
+  /** Serialises mutating operations per project; see `util/lock.ts`. */
+  locks: KeyedMutex;
   /** True when this particular request may not mutate anything. */
   readOnly: boolean;
 }
+
+/**
+ * What a tool hands back.
+ *
+ * `isError` exists because a string result cannot distinguish "done" from "done, except the
+ * part that mattered". Publishing reports partial failures in its text, and without this flag
+ * a model reads a successful-looking response and tells the user the paper was updated when
+ * the upload actually failed.
+ */
+export interface ToolResult {
+  text: string;
+  isError?: boolean;
+}
+
+export type ToolReturn = string | ToolResult;
 
 export interface ToolAnnotations {
   readOnlyHint?: boolean;
@@ -36,7 +54,17 @@ export interface ToolSpec<S extends z.ZodRawShape = z.ZodRawShape> {
   description: string;
   annotations: ToolAnnotations;
   inputSchema: S;
-  run: (ctx: ToolContext, args: z.infer<z.ZodObject<S>>) => Promise<string>;
+  run: (ctx: ToolContext, args: z.infer<z.ZodObject<S>>) => Promise<ToolReturn>;
+}
+
+/** Wrap a successful result. */
+export function ok(text: string): ToolResult {
+  return { text };
+}
+
+/** Wrap a result the model must not read as success. */
+export function failed(text: string): ToolResult {
+  return { text, isError: true };
 }
 
 /** Identity helper that preserves the schema type through the descriptor table. */

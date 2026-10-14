@@ -5,13 +5,14 @@ import { z } from 'zod';
 import { ToolError } from '../util/errors.js';
 import { normalizeRelPath } from '../util/paths.js';
 import { summarizeLatex, renderSummary } from '../overleaf/latex.js';
-import { looksBinary } from '../overleaf/workspace.js';
+import { contentHash, looksBinary } from '../overleaf/workspace.js';
 import { searchIsolated } from './search.js';
 import {
   formatBytesShort,
   formatChanges,
   optionalProject,
   publishIfConfigured,
+  withPublish,
   readyWorkspace,
   refreshBeforeUse,
   requireProjectArg,
@@ -107,7 +108,7 @@ export const fileTools = [
       const content = await workspace.read(args.path);
       const slice = sliceLines(content, args.start_line, args.end_line);
       const header =
-        `# ${normalizeRelPath(args.path)} — ${slice.totalLines} lines` +
+        `# ${normalizeRelPath(args.path)} — ${slice.totalLines} lines — sha256:${contentHash(content)}` +
         (slice.truncated ? ` (showing ${slice.firstLine}–${slice.firstLine + slice.text.split('\n').length - 1})` : '');
       return `${header}\n\n${withLineNumbers(slice.text, slice.firstLine)}`;
     },
@@ -209,6 +210,10 @@ export const fileTools = [
       old_text: z.string().min(1).describe('Exact existing text to replace, copied from read_file output.'),
       new_text: z.string().describe('Replacement text. Use "" to delete the matched text.'),
       replace_all: z.boolean().optional().describe('Replace every occurrence instead of requiring a unique match.'),
+      expected_hash: z
+        .string()
+        .optional()
+        .describe('The sha256 shown by read_file. Refuses the edit if the file has changed since.'),
       project: requiredProject,
     },
     async run(ctx, args) {
@@ -219,6 +224,18 @@ export const fileTools = [
       // silently overwriting their change.
       await refreshBeforeUse(ctx, workspace, args.path);
       const before = await workspace.read(args.path);
+
+      // A caller that states which version it read gets a conflict instead of an overwrite
+      // when the file has moved on underneath it.
+      if (args.expected_hash) {
+        const actual = contentHash(before);
+        if (actual !== args.expected_hash) {
+          throw new ToolError(
+            `${args.path} has changed since it was read (expected sha256:${args.expected_hash}, found sha256:${actual})`,
+            'Read the file again and redo the edit against the current text. Do not guess which version is newer.',
+          );
+        }
+      }
 
       const occurrences = countOccurrences(before, args.old_text);
       if (occurrences === 0) {
@@ -248,7 +265,7 @@ export const fileTools = [
       const publish = await publishIfConfigured(ctx, workspace, {
         message: `edit ${normalizeRelPath(args.path)}`,
       });
-      return `Edited ${normalizeRelPath(args.path)} in "${project.name}" (${project.id}): ${summary}.${publish}`;
+      return withPublish(`Edited ${normalizeRelPath(args.path)} in "${project.name}" (${project.id}): ${summary}.${publish.note}`, publish);
     },
   }),
 
@@ -274,7 +291,7 @@ export const fileTools = [
       const publish = await publishIfConfigured(ctx, workspace, {
         message: `${existed ? 'overwrite' : 'create'} ${normalizeRelPath(args.path)}`,
       });
-      return `${existed ? 'Overwrote' : 'Created'} ${normalizeRelPath(args.path)} in "${project.name}" (${project.id}) — ${lines} lines, ${formatBytesShort(Buffer.byteLength(args.content, 'utf8'))}.${publish}`;
+      return withPublish(`${existed ? 'Overwrote' : 'Created'} ${normalizeRelPath(args.path)} in "${project.name}" (${project.id}) — ${lines} lines, ${formatBytesShort(Buffer.byteLength(args.content, 'utf8'))}.${publish.note}`, publish);
     },
   }),
 
@@ -300,7 +317,7 @@ export const fileTools = [
       const publish = await publishIfConfigured(ctx, workspace, {
         message: `delete ${normalizeRelPath(args.path)}`,
       });
-      return `Deleted ${normalizeRelPath(args.path)} from "${project.name}" (${project.id}).${publish}`;
+      return withPublish(`Deleted ${normalizeRelPath(args.path)} from "${project.name}" (${project.id}).${publish.note}`, publish);
     },
   }),
 
@@ -323,7 +340,7 @@ export const fileTools = [
       const publish = await publishIfConfigured(ctx, workspace, {
         message: `rename ${normalizeRelPath(args.from)} -> ${normalizeRelPath(args.to)}`,
       });
-      return `Moved ${normalizeRelPath(args.from)} to ${normalizeRelPath(args.to)} in "${project.name}" (${project.id}).${publish}`;
+      return withPublish(`Moved ${normalizeRelPath(args.from)} to ${normalizeRelPath(args.to)} in "${project.name}" (${project.id}).${publish.note}`, publish);
     },
   }),
 

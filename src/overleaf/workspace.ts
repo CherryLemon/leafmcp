@@ -21,6 +21,7 @@
 import '../bootstrap.js';
 
 import AdmZip from 'adm-zip';
+import { createHash } from 'node:crypto';
 import { existsSync, readdirSync } from 'node:fs';
 import { cp, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -47,6 +48,19 @@ import { assertNotSymlink, normalizeRelPath, safeArchiveEntry, safeJoin } from '
 export type ChangeStatus = 'added' | 'modified' | 'deleted';
 
 /**
+ * A short, stable fingerprint of a file's contents.
+ *
+ * Returned by `read_file` and accepted by `edit_file`, so an edit can state which version of
+ * the text it was written against. Overleaf offers no atomic conditional write, so this cannot
+ * close the race between the final check and the upload — but it does turn the common case,
+ * "the user changed this file after the model read it", from a silent overwrite into a
+ * conflict the model has to look at.
+ */
+export function contentHash(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 12);
+}
+
+/**
  * Commit subject prefix marking a change made through a tool.
  *
  * `undo` reverses only these, which is what stops it from also reversing a reload from
@@ -68,6 +82,20 @@ export interface PushOutcome {
   /** True when deletions were held back because an upload failed. */
   deletionsDeferred: boolean;
 }
+
+/**
+ * Bounds on what an imported archive may contain.
+ *
+ * The archive comes from Overleaf, but Overleaf's contents are collaborator-controlled, and
+ * `pull` holds the whole thing in memory before extracting. Without limits a project with a
+ * hundred thousand tiny files, or one enormous entry, is enough to exhaust the process. These
+ * are deliberately constants rather than settings: no legitimate LaTeX project comes close,
+ * and a knob here would only invite someone to raise it.
+ */
+const MAX_ARCHIVE_ENTRIES = 5_000;
+const MAX_ARCHIVE_ENTRY_BYTES = 64 * 1024 * 1024;
+const MAX_ARCHIVE_TOTAL_BYTES = 512 * 1024 * 1024;
+const MAX_ARCHIVE_DEPTH = 20;
 
 /** Text-ish extensions we are willing to hand to the model directly. */
 const TEXT_EXTENSIONS = new Set([
@@ -148,11 +176,31 @@ export class ProjectWorkspace {
     await rm(incoming, { recursive: true, force: true });
     await mkdir(incoming, { recursive: true, mode: 0o700 });
 
+    const entries = zip.getEntries();
+    if (entries.length > MAX_ARCHIVE_ENTRIES) {
+      throw new ToolError(
+        `refusing to import: the project archive has ${entries.length} entries (limit ${MAX_ARCHIVE_ENTRIES})`,
+        'This usually means the archive is not a normal Overleaf export.',
+      );
+    }
+
     let fileCount = 0;
+    let extractedBytes = 0;
     const skipped: string[] = [];
     try {
-      for (const entry of zip.getEntries()) {
+      for (const entry of entries) {
         if (entry.isDirectory) continue;
+
+        if (entry.entryName.split('/').length > MAX_ARCHIVE_DEPTH) {
+          skipped.push(entry.entryName);
+          continue;
+        }
+        // The header's declared size is checked before decompressing, and the real length is
+        // checked after — a crafted archive can understate it.
+        if (entry.header.size > MAX_ARCHIVE_ENTRY_BYTES) {
+          skipped.push(entry.entryName);
+          continue;
+        }
         // An archive is attacker-controlled input: an entry named `.git/config` would
         // otherwise be written straight into the repository we are about to run git in.
         const target = safeArchiveEntry(incoming, entry.entryName);
@@ -160,8 +208,20 @@ export class ProjectWorkspace {
           skipped.push(entry.entryName);
           continue;
         }
+        const data = entry.getData();
+        if (data.length > MAX_ARCHIVE_ENTRY_BYTES) {
+          skipped.push(entry.entryName);
+          continue;
+        }
+        extractedBytes += data.length;
+        if (extractedBytes > MAX_ARCHIVE_TOTAL_BYTES) {
+          throw new ToolError(
+            `refusing to import: the archive expands beyond ${Math.round(MAX_ARCHIVE_TOTAL_BYTES / (1024 * 1024))} MB`,
+            'Extract it locally and upload only the sources the project needs.',
+          );
+        }
         await mkdir(dirname(target), { recursive: true });
-        await writeFile(target, entry.getData());
+        await writeFile(target, data);
         fileCount += 1;
       }
       if (skipped.length > 0) {

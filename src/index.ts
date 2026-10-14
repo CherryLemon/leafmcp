@@ -25,6 +25,7 @@ import { OAuthStore } from './auth/store.js';
 import { ProjectRegistry, WorkspaceManager } from './overleaf/registry.js';
 import { OverleafSession } from './overleaf/session.js';
 import { SERVER_INSTRUCTIONS, registerTools } from './tools/index.js';
+import { KeyedMutex } from './util/lock.js';
 import { createHttpApp } from './transport/http.js';
 import { errorMessage, registerSecret } from './util/errors.js';
 import { log } from './util/logger.js';
@@ -100,7 +101,14 @@ async function runStdio(config: AppConfig): Promise<void> {
     { name: SERVER_NAME, version: SERVER_VERSION },
     { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS },
   );
-  registerTools(server, { config, session, registry, workspaces, readOnly: config.readOnly });
+  registerTools(server, {
+    config,
+    session,
+    registry,
+    workspaces,
+    locks: new KeyedMutex(),
+    readOnly: config.readOnly,
+  });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

@@ -33,6 +33,8 @@ process.env.LOG_LEVEL = 'error';
 
 const { loadConfig } = await import('../dist/bootstrap.js').then(() => import('../dist/config.js'));
 const { ProjectWorkspace } = await import('../dist/overleaf/workspace.js');
+const { KeyedMutex } = await import('../dist/util/lock.js');
+const { runWithProjectLock } = await import('../dist/tools/index.js');
 const { buildTools } = await import('../dist/tools/build.js');
 const AdmZip = (await import('adm-zip')).default;
 const { OAuthProvider } = await import('../dist/auth/provider.js');
@@ -485,6 +487,18 @@ try {
     await new Promise((resolve) => bearerServer.close(resolve));
   }
 
+  // ── regression: the consent screen refuses to be framed or cached ──────────
+  section('Regression — the consent screen is hardened');
+
+  const consentResponse = await fetch(`${base}/oauth/authorize?${authorizeQuery}`);
+  const csp = consentResponse.headers.get('content-security-policy') ?? '';
+  check('consent page sets a CSP', csp.includes("default-src 'none'"), csp);
+  check('consent page cannot be framed by CSP', csp.includes("frame-ancestors 'none'"), csp);
+  check('consent page restricts form targets', csp.includes("form-action 'self'"), csp);
+  check('consent page sets X-Frame-Options', consentResponse.headers.get('x-frame-options') === 'DENY');
+  check('consent page is not cached', consentResponse.headers.get('cache-control') === 'no-store');
+  check('consent page sets a referrer policy', consentResponse.headers.get('referrer-policy') === 'no-referrer');
+
   // ── regression: guessing the passphrase is rate limited ────────────────────
   section('Regression — the consent screen is throttled');
 
@@ -725,6 +739,7 @@ try {
     session: { run: (fn) => fn(fakeClient) },
     registry: { resolve: async () => ({ id: 'proj123', name: 'Smoke Thesis' }) },
     workspaces: { for: () => ws },
+    locks: new KeyedMutex(),
   };
 
   const compileTool = buildTools.find((tool) => tool.name === 'compile');
@@ -892,6 +907,7 @@ try {
     session: { run: (fn) => fn({}) },
     registry: { resolve: async () => ({ id: 'editprobe', name: 'Edit Probe' }) },
     workspaces: { for: () => ws5 },
+    locks: new KeyedMutex(),
   };
 
   const latexMath = '$$E = mc^2$$';
@@ -949,6 +965,253 @@ try {
     timeoutMs: 1500,
   });
   check('a literal search over the same file is fine', literal.timedOut === false && literal.hits.length === 1);
+
+  // ── regression: concurrent edits to one project serialise ─────────────────
+  section('Regression — concurrent edits to a project do not lose each other');
+
+  // Without a lock both calls read the same base, and the second write discards the first.
+  // The lock is taken in the registration layer, so this drives `runWithProjectLock`, which
+  // is the function every tool call actually goes through.
+  const concurrencyZip = new AdmZip();
+  concurrencyZip.addFile('both.tex', Buffer.from('ALPHA_MARKER\nBETA_MARKER\n'));
+  const concurrencyClient = {
+    downloadProject: async () => concurrencyZip.toBuffer(),
+    uploadFile: async () => ({ success: true }),
+    deleteByPath: async () => undefined,
+    invalidateFolderTree: () => undefined,
+  };
+  const ws6 = new ProjectWorkspace(dataDir, 'lockprobe', 'Lock Probe', { maxFileBytes: 1024 * 1024 });
+  await ws6.pull(concurrencyClient);
+
+  const lockCtx = {
+    config: { ...config, autoPush: false, readOnly: false, freshReads: false },
+    readOnly: false,
+    session: { run: (fn) => fn(concurrencyClient) },
+    registry: { resolve: async () => ({ id: 'lockprobe', name: 'Lock Probe' }) },
+    workspaces: { for: () => ws6 },
+    locks: new KeyedMutex(),
+  };
+
+  const editBoth = fileTools.find((tool) => tool.name === 'edit_file');
+  await Promise.all([
+    runWithProjectLock(lockCtx, editBoth, { path: 'both.tex', old_text: 'ALPHA_MARKER', new_text: 'ALPHA_DONE', project: 'lockprobe' }),
+    runWithProjectLock(lockCtx, editBoth, { path: 'both.tex', old_text: 'BETA_MARKER', new_text: 'BETA_DONE', project: 'lockprobe' }),
+  ]);
+  const bothEdits = await ws6.read('both.tex');
+  check('the first concurrent edit survived', bothEdits.includes('ALPHA_DONE'), JSON.stringify(bothEdits));
+  check('the second concurrent edit survived', bothEdits.includes('BETA_DONE'), JSON.stringify(bothEdits));
+
+  // A failing operation must not wedge the queue behind it.
+  const queue = new KeyedMutex();
+  await queue.run('k', async () => undefined);
+  let afterFailureRan = false;
+  await queue
+    .run('k', async () => {
+      throw new Error('deliberate');
+    })
+    .catch(() => undefined);
+  await queue.run('k', async () => {
+    afterFailureRan = true;
+  });
+  check('a failed operation does not block the next one on the same key', afterFailureRan);
+
+  // Different projects must not wait on each other.
+  let releaseSlow;
+  const slowGate = new Promise((resolve) => {
+    releaseSlow = resolve;
+  });
+  const order = [];
+  const slow = queue.run('project-a', async () => {
+    order.push('a-start');
+    await slowGate;
+    order.push('a-end');
+  });
+  await queue.run('project-b', async () => {
+    order.push('b-ran');
+  });
+  check('a different project runs while another is held', order.includes('b-ran'), JSON.stringify(order));
+  releaseSlow();
+  await slow;
+  check('keys are released once idle', queue.activeKeys === 0, String(queue.activeKeys));
+
+  // ── regression: a partial publish is reported as a failure ────────────────
+  section('Regression — a partial publish is not reported as success');
+
+  const failZip = new AdmZip();
+  failZip.addFile('paper.tex', Buffer.from('CHANGE_ME\n'));
+  const ws7 = new ProjectWorkspace(dataDir, 'failprobe', 'Fail Probe', { maxFileBytes: 1024 * 1024 });
+  const refusingClient = {
+    downloadProject: async () => failZip.toBuffer(),
+    uploadFile: async () => {
+      throw new Error('overleaf refused the upload');
+    },
+    deleteByPath: async () => undefined,
+    invalidateFolderTree: () => undefined,
+  };
+  await ws7.pull({ ...refusingClient, uploadFile: async () => ({ success: true }) });
+
+  const failCtx = {
+    config: { ...config, autoPush: true, readOnly: false, freshReads: false },
+    readOnly: false,
+    session: { run: (fn) => fn(refusingClient) },
+    registry: { resolve: async () => ({ id: 'failprobe', name: 'Fail Probe' }) },
+    workspaces: { for: () => ws7 },
+    locks: new KeyedMutex(),
+  };
+
+  const failedEdit = await editBoth.run(failCtx, {
+    path: 'paper.tex',
+    old_text: 'CHANGE_ME',
+    new_text: 'CHANGED',
+    project: 'failprobe',
+  });
+  check('the edit is written locally', (await ws7.read('paper.tex')).includes('CHANGED'));
+  check('the failure is marked as an error result', failedEdit.isError === true, JSON.stringify(failedEdit));
+  check('the message says it was not published', /NOT PUBLISHED/.test(failedEdit.text), failedEdit.text);
+  check('the tool does not claim success', !/^Edited .*\.$/m.test(failedEdit.text) || failedEdit.isError === true);
+
+  // ── regression: an edit can state which version it was written against ─────
+  section('Regression — edits can be pinned to a version');
+
+  const hashZip = new AdmZip();
+  hashZip.addFile('pinned.tex', Buffer.from('STABLE\n'));
+  const ws8 = new ProjectWorkspace(dataDir, 'hashprobe', 'Hash Probe', { maxFileBytes: 1024 * 1024 });
+  await ws8.pull({
+    downloadProject: async () => hashZip.toBuffer(),
+    uploadFile: async () => ({ success: true }),
+    deleteByPath: async () => undefined,
+    invalidateFolderTree: () => undefined,
+  });
+
+  const hashCtx = {
+    config: { ...config, autoPush: false, readOnly: false, freshReads: false },
+    readOnly: false,
+    session: { run: (fn) => fn({}) },
+    registry: { resolve: async () => ({ id: 'hashprobe', name: 'Hash Probe' }) },
+    workspaces: { for: () => ws8 },
+    locks: new KeyedMutex(),
+  };
+  const readTool = fileTools.find((tool) => tool.name === 'read_file');
+
+  const readResult = await readTool.run(hashCtx, { path: 'pinned.tex', project: 'hashprobe' });
+  const hashMatch = /sha256:([0-9a-f]{12})/.exec(readResult);
+  check('read_file reports a content hash', hashMatch !== null, readResult.split('\n')[0]);
+
+  const goodHash = hashMatch[1];
+  const pinnedEdit = await editBoth.run(hashCtx, {
+    path: 'pinned.tex',
+    old_text: 'STABLE',
+    new_text: 'PINNED',
+    expected_hash: goodHash,
+    project: 'hashprobe',
+  });
+  check('an edit pinned to the current version is accepted', pinnedEdit.isError !== true, JSON.stringify(pinnedEdit));
+
+  let staleRefused = false;
+  try {
+    await editBoth.run(hashCtx, {
+      path: 'pinned.tex',
+      old_text: 'PINNED',
+      new_text: 'STALE',
+      expected_hash: goodHash,
+      project: 'hashprobe',
+    });
+  } catch (error) {
+    staleRefused = /changed since it was read/.test(String(error.message));
+  }
+  check('an edit pinned to a stale version is refused', staleRefused);
+  check('the refused edit changed nothing', (await ws8.read('pinned.tex')).includes('PINNED'));
+
+  // ── regression: unauthenticated registration is bounded ───────────────────
+  section('Regression — registration is bounded');
+
+  const longName = await fetch(`${base}/oauth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ client_name: 'x'.repeat(500), redirect_uris: [CLAUDE_CALLBACK] }),
+  });
+  check('an oversized client_name is refused', longName.status === 400, String(longName.status));
+
+  const manyUris = await fetch(`${base}/oauth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ redirect_uris: Array.from({ length: 12 }, () => CLAUDE_CALLBACK) }),
+  });
+  check('too many redirect_uris are refused', manyUris.status === 400, String(manyUris.status));
+
+  const longUri = await fetch(`${base}/oauth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ redirect_uris: [`http://127.0.0.1:1/${'a'.repeat(3000)}`] }),
+  });
+  check('an oversized redirect_uri is refused', longUri.status === 400, String(longUri.status));
+
+  const fatBody = await fetch(`${base}/oauth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ client_name: 'x'.repeat(64 * 1024), redirect_uris: [CLAUDE_CALLBACK] }),
+  });
+  check('a body over the OAuth limit is refused', fatBody.status === 413, String(fatBody.status));
+
+  // The cap itself is checked in the provider, past the rate limiter, so it is exercised
+  // directly — 200 HTTP registrations would be throttled long before reaching it.
+  const capStore = new OAuthStore(join(dataDir, 'cap-probe.json'));
+  const capProvider = new OAuthProvider({
+    store: capStore,
+    issuer: config.auth.oauth.issuer,
+    resourceUrl: `${config.publicUrl}/mcp`,
+    password: PASS,
+    oauthEnabled: true,
+  });
+  for (let i = 0; i < 200; i += 1) {
+    await capStore.putClient({
+      client_id: `seed_${i}`,
+      redirect_uris: [CLAUDE_CALLBACK],
+      grant_types: ['authorization_code'],
+      response_types: ['code'],
+      token_endpoint_auth_method: 'none',
+      created_at: Date.now(),
+    });
+  }
+  let capRefused = false;
+  try {
+    await capProvider.registerClient({ redirect_uris: [CLAUDE_CALLBACK] });
+  } catch (error) {
+    capRefused = /maximum of 200/.test(String(error.message));
+  }
+  check('the total number of registered clients is capped', capRefused);
+
+  // ── regression: an absurd archive is refused ──────────────────────────────
+  section('Regression — archive imports are bounded');
+
+  const bombZip = new AdmZip();
+  for (let i = 0; i < 5001; i += 1) bombZip.addFile(`f${i}.tex`, Buffer.from('x'));
+  const ws9 = new ProjectWorkspace(dataDir, 'bombprobe', 'Bomb Probe', { maxFileBytes: 1024 * 1024 });
+  let bombRefused = false;
+  try {
+    await ws9.pull({
+      downloadProject: async () => bombZip.toBuffer(),
+      uploadFile: async () => ({ success: true }),
+      deleteByPath: async () => undefined,
+      invalidateFolderTree: () => undefined,
+    });
+  } catch (error) {
+    bombRefused = /too many|entries/.test(String(error.message)) || /entries/.test(String(error.message));
+  }
+  check('an archive with too many entries is refused', bombRefused);
+
+  const deepZip = new AdmZip();
+  deepZip.addFile(`${Array.from({ length: 25 }, (_, i) => `d${i}`).join('/')}/deep.tex`, Buffer.from('deep\n'));
+  deepZip.addFile('shallow.tex', Buffer.from('shallow\n'));
+  const ws10 = new ProjectWorkspace(dataDir, 'deepprobe', 'Deep Probe', { maxFileBytes: 1024 * 1024 });
+  const deepResult = await ws10.pull({
+    downloadProject: async () => deepZip.toBuffer(),
+    uploadFile: async () => ({ success: true }),
+    deleteByPath: async () => undefined,
+    invalidateFolderTree: () => undefined,
+  });
+  check('an over-deep entry is skipped, not extracted', deepResult.fileCount === 1, String(deepResult.fileCount));
+  check('the shallow entry still arrived', ws10.listFiles().join(',') === 'shallow.tex', ws10.listFiles().join(','));
 
   // ── regression: the token store is not world-readable ──────────────────────
   section('Regression — OAuth state file permissions');

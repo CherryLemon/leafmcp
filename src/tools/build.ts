@@ -95,7 +95,10 @@ export const buildTools = [
           ...outcome.failed.map((f) => `  ${f.path}: ${f.reason}`),
         );
       }
-      return lines.join('\n');
+      const text = lines.join('\n');
+      // Partially published is a failure, not a footnote: the model must not summarise it
+      // as "the changes are on Overleaf".
+      return outcome.failed.length > 0 ? { text, isError: true } : { text };
     },
   }),
 
@@ -162,7 +165,8 @@ export const buildTools = [
         outcome.failed.length > 0
           ? `\nBut ${outcome.failed.length} file(s) could not be pushed: ${outcome.failed.map((f) => f.path).join(', ')}`
           : '';
-      return `Undid ${args.steps ?? 1} edit(s) in "${project.name}" and republished (${outcome.uploaded.length} file(s) updated)${detail}.\nReverted commits: ${reverted.join(', ')}`;
+      const undone = `Undid ${args.steps ?? 1} edit(s) in "${project.name}" and republished (${outcome.uploaded.length} file(s) updated)${detail}.\nReverted commits: ${reverted.join(', ')}`;
+      return outcome.failed.length > 0 ? { text: undone, isError: true } : { text: undone };
     },
   }),
 ];

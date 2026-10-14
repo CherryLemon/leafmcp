@@ -8,7 +8,7 @@
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
-import { ReadOnlyError, type AnyToolSpec, type ToolContext } from './types.js';
+import { ReadOnlyError, type AnyToolSpec, type ToolContext, type ToolReturn } from './types.js';
 import { ToolError, errorMessage, redact } from '../util/errors.js';
 import { commentTools } from './comments.js';
 import { buildTools } from './build.js';
@@ -53,11 +53,16 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       async (args: Record<string, unknown>) => {
         const started = Date.now();
         try {
-          const text = await spec.run(ctx, args as never);
+          const text = await runWithProjectLock(ctx, spec, args);
           log.debug(`tool ${spec.name} ok in ${Date.now() - started}ms`);
           // Tool output is model-visible, so it is scrubbed on the way out too: a file could
           // in principle contain a credential, and anything the model sees leaves this host.
-          return { content: [{ type: 'text' as const, text: redact(text) }] };
+          return typeof text === 'string'
+            ? { content: [{ type: 'text' as const, text: redact(text) }] }
+            : {
+                content: [{ type: 'text' as const, text: redact(text.text) }],
+                ...(text.isError ? { isError: true } : {}),
+              };
         } catch (error) {
           // Tool failures are normal control flow for a model (wrong path, ambiguous edit),
           // so they are reported as an error *result* it can act on, not as a transport fault.
@@ -70,6 +75,30 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       },
     );
   }
+}
+
+/**
+ * Run mutating tools under their project's write lock.
+ *
+ * The lock is taken here rather than inside each handler so it cannot be forgotten, and so it
+ * covers the whole operation — refresh from Overleaf, read, decide, write, commit, publish.
+ * Locking individual steps would still let two edits interleave between their read and their
+ * write, which is exactly the overwrite this exists to prevent.
+ *
+ * "Mutating" is read off the annotations the tools already declare for their clients:
+ * anything that is not advertised as read-only changes something.
+ */
+export async function runWithProjectLock(
+  ctx: ToolContext,
+  spec: AnyToolSpec,
+  args: Record<string, unknown>,
+): Promise<ToolReturn> {
+  if (spec.annotations.readOnlyHint === true) {
+    return spec.run(ctx, args as never);
+  }
+  const projectRef = typeof args.project === 'string' ? args.project : undefined;
+  const project = await ctx.registry.resolve(projectRef);
+  return ctx.locks.run(project.id, () => spec.run(ctx, args as never));
 }
 
 export type { ToolContext, ToolSpec } from './types.js';

@@ -18,6 +18,20 @@ import { AUTH_CODE_TTL_MS, ACCESS_TOKEN_TTL_MS, REFRESH_TOKEN_TTL_MS } from './s
 import type { AuthCode, OAuthClient, OAuthStore, TokenRecord } from './store.js';
 import { log } from '../util/logger.js';
 
+/**
+ * Bounds on dynamic client registration.
+ *
+ * Registration needs no credentials by design (that is how the assistants onboard), which
+ * makes it the one place an anonymous caller can make the server do unbounded work: every
+ * accepted client is a permanent record in a JSON file that is rewritten wholesale on each
+ * token operation.
+ */
+const MAX_REGISTERED_CLIENTS = 200;
+const MAX_CLIENT_NAME_LENGTH = 200;
+const MAX_SCOPE_LENGTH = 500;
+const MAX_REDIRECT_URIS = 10;
+const MAX_REDIRECT_URI_LENGTH = 2000;
+
 export const SCOPE_READ = 'overleaf.read';
 export const SCOPE_WRITE = 'overleaf.write';
 export const SUPPORTED_SCOPES = [SCOPE_READ, SCOPE_WRITE] as const;
@@ -155,17 +169,46 @@ export class OAuthProvider {
   // ── dynamic client registration (RFC 7591) ───────────────────────────────
 
   async registerClient(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    // Registration is unauthenticated, so every value it accepts is bounded. Without this a
+    // caller can grow the client table without limit, and each stored record is rewritten in
+    // full on every token operation.
+    const name = typeof body.client_name === 'string' ? body.client_name : undefined;
+    if (name !== undefined && name.length > MAX_CLIENT_NAME_LENGTH) {
+      throw new OAuthError('invalid_client_metadata', `client_name must be at most ${MAX_CLIENT_NAME_LENGTH} characters`);
+    }
+    const scope = typeof body.scope === 'string' ? body.scope : undefined;
+    if (scope !== undefined && scope.length > MAX_SCOPE_LENGTH) {
+      throw new OAuthError('invalid_client_metadata', `scope must be at most ${MAX_SCOPE_LENGTH} characters`);
+    }
+
     const rawUris = body.redirect_uris;
     if (!Array.isArray(rawUris) || rawUris.length === 0) {
       throw new OAuthError('invalid_redirect_uri', 'redirect_uris is required');
     }
+    if (rawUris.length > MAX_REDIRECT_URIS) {
+      throw new OAuthError('invalid_redirect_uri', `at most ${MAX_REDIRECT_URIS} redirect_uris are accepted`);
+    }
     const redirectUris = rawUris.filter((u): u is string => typeof u === 'string');
+    const tooLong = redirectUris.find((uri) => uri.length > MAX_REDIRECT_URI_LENGTH);
+    if (tooLong !== undefined) {
+      throw new OAuthError('invalid_redirect_uri', `each redirect_uri must be at most ${MAX_REDIRECT_URI_LENGTH} characters`);
+    }
     const rejected = redirectUris.filter((uri) => !this.isRedirectAllowed(uri));
     if (rejected.length > 0 || redirectUris.length === 0) {
       throw new OAuthError(
         'invalid_redirect_uri',
         `redirect_uri not allowed: ${rejected.join(', ') || '(none valid)'}. ` +
           'Only known assistant callbacks and loopback addresses are accepted.',
+      );
+    }
+
+    const existing = await this.options.store.listClients();
+    if (existing.length >= MAX_REGISTERED_CLIENTS) {
+      throw new OAuthError(
+        'invalid_client_metadata',
+        `this server already holds the maximum of ${MAX_REGISTERED_CLIENTS} registered clients; ` +
+          'remove unused ones from the OAuth state file before registering more',
+        403,
       );
     }
 
@@ -182,12 +225,12 @@ export class OAuthProvider {
     const client: OAuthClient = {
       client_id: clientId,
       client_secret: clientSecret,
-      client_name: typeof body.client_name === 'string' ? body.client_name : undefined,
+      client_name: name,
       redirect_uris: redirectUris,
       grant_types: ['authorization_code', 'refresh_token'],
       response_types: ['code'],
       token_endpoint_auth_method: authMethod,
-      scope: typeof body.scope === 'string' ? body.scope : SUPPORTED_SCOPES.join(' '),
+      scope: scope ?? SUPPORTED_SCOPES.join(' '),
       created_at: Date.now(),
     };
     await this.options.store.putClient(client);

@@ -25,6 +25,7 @@ import { ProjectRegistry, WorkspaceManager } from '../overleaf/registry.js';
 import { OverleafSession } from '../overleaf/session.js';
 import { ALL_TOOLS, SERVER_INSTRUCTIONS, registerTools } from '../tools/index.js';
 import { rateLimit } from '../util/ratelimit.js';
+import { KeyedMutex } from '../util/lock.js';
 import { errorMessage } from '../util/errors.js';
 import { log } from '../util/logger.js';
 
@@ -37,8 +38,15 @@ export interface HttpDependencies {
 const SERVER_NAME = 'overleaf-mcp';
 const SERVER_VERSION = '0.1.0';
 
-/** Conservative ceiling on a single JSON-RPC request body. */
-const BODY_LIMIT = '4mb';
+/**
+ * Ceilings on request bodies, applied per route rather than globally.
+ *
+ * `/mcp` needs room: a `write_file` call carries a whole file. The OAuth endpoints carry only
+ * a handful of short fields, and they are reachable without credentials, so they get a limit
+ * small enough that they cannot be used to make the process allocate.
+ */
+const MCP_BODY_LIMIT = '4mb';
+const OAUTH_BODY_LIMIT = '16kb';
 
 function buildServer(ctx: Parameters<typeof registerTools>[1]): McpServer {
   const server = new McpServer(
@@ -59,12 +67,19 @@ export function createHttpApp(deps: HttpDependencies): Express {
   app.set('trust proxy', config.trustProxy);
   app.disable('x-powered-by');
 
+  // Shared across requests on purpose: it is what makes concurrent edits to one project
+  // serialise, while different projects stay fully concurrent.
+  const locks = new KeyedMutex();
   const session = new OverleafSession(config.overleaf);
   const registry = new ProjectRegistry(session, config);
   const workspaces = new WorkspaceManager(config);
 
-  app.use(express.json({ limit: BODY_LIMIT }));
-  app.use(express.urlencoded({ extended: false, limit: BODY_LIMIT }));
+  // No global body parser: each route gets the limit it actually needs, so an
+  // unauthenticated endpoint cannot be handed a multi-megabyte payload.
+  const oauthBody = [
+    express.json({ limit: OAUTH_BODY_LIMIT }),
+    express.urlencoded({ extended: false, limit: OAUTH_BODY_LIMIT }),
+  ];
 
   app.get('/healthz', (_req: Request, res: Response) => {
     res.json({
@@ -86,6 +101,7 @@ export function createHttpApp(deps: HttpDependencies): Express {
   // configured at all — an easy way to hand out access nobody asked for.
   if (config.auth.mode === 'oauth') {
     // Every one of these is reachable without credentials, so each gets its own budget.
+    app.use(['/oauth', '/.well-known'], ...oauthBody);
     app.use('/oauth/register', rateLimit({ windowMs: 60_000, max: 10 }));
     app.use('/oauth/token', rateLimit({ windowMs: 60_000, max: 30 }));
     // The consent screen is the one endpoint where guessing a secret pays off, so it is
@@ -100,7 +116,7 @@ export function createHttpApp(deps: HttpDependencies): Express {
     const principal = readPrincipal(req);
     const readOnly = config.readOnly || !mayWrite(principal);
 
-    const server = buildServer({ config, session, registry, workspaces, readOnly });
+    const server = buildServer({ config, session, registry, workspaces, locks, readOnly });
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // stateless
       enableJsonResponse: config.jsonResponses,
@@ -131,7 +147,7 @@ export function createHttpApp(deps: HttpDependencies): Express {
     }
   };
 
-  app.post('/mcp', guard, (req, res) => {
+  app.post('/mcp', express.json({ limit: MCP_BODY_LIMIT }), guard, (req, res) => {
     void handleMcp(req, res);
   });
 

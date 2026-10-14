@@ -131,6 +131,25 @@ export function createAuthRouter(options: AuthRouterOptions): Router {
   const { provider } = options;
   const router = Router();
 
+  // The consent screen is the one page where a click decides whether a stranger gets write
+  // access to someone's papers, so it refuses to be framed and refuses to be cached.
+  // `form-action 'self'` is what keeps an injected form from posting the passphrase elsewhere;
+  // there is no script on the page at all, hence `script-src 'none'`.
+  router.use((_req, res, next) => {
+    res.set('Content-Security-Policy', [
+      "default-src 'none'",
+      "style-src 'unsafe-inline'",
+      "form-action 'self'",
+      "frame-ancestors 'none'",
+      "base-uri 'none'",
+    ].join('; '));
+    res.set('X-Frame-Options', 'DENY');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Referrer-Policy', 'no-referrer');
+    res.set('Cache-Control', 'no-store');
+    next();
+  });
+
   const serveProtectedResourceMetadata = (_req: Request, res: Response): void => {
     res.json(provider.protectedResourceMetadata());
   };
