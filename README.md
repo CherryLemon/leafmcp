@@ -175,6 +175,37 @@ PUBLIC_URL=https://mcp.example.com node dist/index.js
 
 Put Nginx or Caddy in front for TLS.
 
+### On your own machine, with Cloudflare Tunnel
+
+This is the right shape for a home server or a laptop-as-a-server: `cloudflared` dials **out** to
+Cloudflare, so you need no public IP, no port forwarding, and no inbound firewall rule — and it
+keeps working when your ISP changes your address or puts you behind CGNAT. Cloudflare terminates
+TLS, so there is no Caddy in this arrangement.
+
+```bash
+CF_TUNNEL_TOKEN=<token> docker compose -f docker/docker-compose.cloudflare.yml up -d
+```
+
+The header of [`docker/docker-compose.cloudflare.yml`](docker/docker-compose.cloudflare.yml) has
+the dashboard steps, including the one detail that is easy to get wrong: the tunnel's public
+hostname must point at `overleaf-mcp:8080` (the compose service name), **not** `localhost:8080`.
+
+Four Cloudflare settings decide whether this works:
+
+| Setting | Value | Why |
+|---|---|---|
+| `MCP_JSON_RESPONSES` | **`false`** | Cloudflare returns error 524 when the origin sends nothing for 125 seconds, and a JSON-mode tool call sends nothing until it finishes — a slow LaTeX compile can trip it. SSE mode starts responding immediately and then streams. Note this is the **opposite** of the default, which is chosen for a same-host reverse proxy. |
+| Bot Fight Mode | **off** | The assistants call from cloud IPs with non-browser user agents, so bot protection 403s them — and the client only reports "not a valid MCP server". |
+| Cloudflare Access | **do not enable** | It requires an interactive login, which server-to-server clients cannot perform. LeafMCP runs its own OAuth; the consent page is opened in *your* browser, so Access would work for that one step and fail for everything else — a confusing half-broken state. |
+| SSL/TLS mode | **Full** | Flexible is insecure and a common source of subtle breakage. |
+
+Also add a cache-bypass rule for the hostname. `POST /mcp` is not cached by default, but a stale
+`.well-known/oauth-protected-resource` would break OAuth discovery.
+
+**Be realistic about uptime:** with this arrangement the server is available only while your
+machine is awake and online. A laptop that sleeps looks like a flaky assistant, and the error
+messages clients produce are not specific about why.
+
 ## Connecting clients
 
 The MCP endpoint is always:
@@ -382,6 +413,8 @@ are skipped rather than extracted.
 | Symptom | Cause and fix |
 |---|---|
 | Client says "not a valid MCP server" | Clients POST `initialize` straight to the registered URL and never use legacy SSE. Make sure you entered `https://domain/mcp` (**not** `/sse`) and that `/healthz` is publicly reachable. |
+| Tool calls fail after roughly two minutes (Cloudflare error 524) | The origin sent nothing for 125 seconds. Set `MCP_JSON_RESPONSES=false` so responses stream; a JSON-mode call stays silent until the tool finishes. |
+| "Not a valid MCP server" only when behind Cloudflare | Bot Fight Mode is rejecting the assistants, which call from cloud IPs with non-browser user agents. Turn it off for the zone, or add a WAF skip rule for the hostname. |
 | Connection times out | Requests come from the vendors' clouds. Check for an IPv4 `A` record, a valid certificate, and no firewall rule limited to your own IP. Anthropic's egress range is `160.79.104.0/21`. |
 | Consent page will not open, or authorization fails | `PUBLIC_URL` must match the address clients use **exactly**. The `resource` in the discovery metadata must equal the MCP URL precisely; clients validate it strictly. |
 | Tools fail with a session error | `overleaf_session2` changes when you log out or the session expires. Copy it again. Self-hosted instances can set `OVERLEAF_EMAIL` / `OVERLEAF_PASSWORD` for automatic re-login. |

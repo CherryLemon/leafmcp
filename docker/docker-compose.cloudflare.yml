@@ -1,0 +1,53 @@
+# LeafMCP on a home machine, published through a Cloudflare Tunnel.
+#
+# This is the right shape when the server runs on your own computer: the tunnel dials
+# *out* to Cloudflare, so you need no public IP, no port forwarding, and no inbound
+# firewall rule — and it keeps working when your ISP changes your address or puts you
+# behind CGNAT. Cloudflare terminates TLS at its edge, which is why there is no Caddy here.
+#
+#   1. In the Cloudflare dashboard: Zero Trust → Networks → Tunnels → Create a tunnel
+#      (choose "Cloudflared"), then copy the tunnel token.
+#   2. Add a public hostname to that tunnel:
+#        Subdomain : mcp
+#        Domain    : your-domain.com
+#        Type      : HTTP
+#        URL       : overleaf-mcp:8080      ← the compose service name, NOT localhost
+#   3. cp .env.example .env  and set at least:
+#        PUBLIC_URL=https://mcp.example.com   (must equal the hostname from step 2)
+#        MCP_AUTH_MODE=oauth
+#        MCP_OAUTH_PASSWORD=<openssl rand -base64 24>
+#        MCP_JSON_RESPONSES=false             (see the note below — this one matters)
+#        CF_TUNNEL_TOKEN=<token from step 1>
+#   4. CF_TUNNEL_TOKEN=<token> docker compose -f docker/docker-compose.cloudflare.yml up -d
+#
+# Why MCP_JSON_RESPONSES=false: Cloudflare returns error 524 if the origin does not start
+# responding within its 125-second proxy read timeout. In the default JSON mode a tool call
+# sends nothing until it finishes, so a slow LaTeX compile can trip that. In SSE mode the
+# response starts immediately and then streams, which keeps the connection healthy for as
+# long as the tool needs.
+
+services:
+  overleaf-mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file:
+      - ../.env
+    volumes:
+      - mcp-data:/data
+    restart: unless-stopped
+    # Nothing is published to the host at all: the only way in is through the tunnel.
+    expose:
+      - '8080'
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    depends_on:
+      - overleaf-mcp
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN:?set CF_TUNNEL_TOKEN to the token from the Cloudflare dashboard}
+
+volumes:
+  mcp-data:
