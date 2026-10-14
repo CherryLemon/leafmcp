@@ -1,0 +1,22 @@
+# Caddy terminates TLS and forwards to the MCP server.
+#
+# Two details that matter for MCP specifically:
+#
+#   flush_interval -1  disables response buffering. Tool calls can take a while (a compile
+#                      is tens of seconds); buffered responses look like a hung server.
+#   X-Forwarded-For    is set by Caddy automatically and the app trusts it, so the OAuth
+#                      rate limiter buckets per real client instead of one shared bucket.
+
+{$MCP_DOMAIN} {
+	encode zstd gzip
+
+	reverse_proxy overleaf-mcp:8080 {
+		flush_interval -1
+		header_up X-Real-IP {remote_host}
+	}
+
+	log {
+		output stderr
+		format console
+	}
+}

@@ -1,0 +1,54 @@
+{
+  "name": "leafmcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Remote MCP server that lets AI assistants read and edit your Overleaf projects",
+  "license": "MIT",
+  "author": "CherryLemon",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CherryLemon/leafmcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/CherryLemon/leafmcp/issues"
+  },
+  "homepage": "https://github.com/CherryLemon/leafmcp#readme",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "overleaf",
+    "latex",
+    "gemini",
+    "claude",
+    "chatgpt",
+    "ai-agents",
+    "oauth2"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "node --experimental-transform-types src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node test/smoke.mjs",
+    "smoke": "node test/smoke.mjs",
+    "check": "node dist/index.js --check",
+    "verify": "node dist/index.js --verify"
+  },
+  "dependencies": {
+    "@aloth/olcli": "^0.13.1",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "adm-zip": "^0.5.16",
+    "express": "^5.3.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  }
+}

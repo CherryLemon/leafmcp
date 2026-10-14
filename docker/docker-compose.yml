@@ -1,0 +1,41 @@
+# Overleaf MCP + automatic HTTPS.
+#
+#   1. cp .env.example .env   and fill it in (PUBLIC_URL must match MCP_DOMAIN below)
+#   2. MCP_DOMAIN=mcp.example.com docker compose -f docker/docker-compose.yml up -d
+#
+# Caddy obtains and renews the TLS certificate on its own, which matters because the
+# vendor clients reject anything that is not valid public HTTPS.
+
+services:
+  overleaf-mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file:
+      - ../.env
+    volumes:
+      - mcp-data:/data
+    restart: unless-stopped
+    # Not published to the host: only Caddy reaches it, over the compose network.
+    expose:
+      - '8080'
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - overleaf-mcp
+    ports:
+      - '80:80'
+      - '443:443'
+    environment:
+      MCP_DOMAIN: ${MCP_DOMAIN:?set MCP_DOMAIN to the public hostname, e.g. mcp.example.com}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+volumes:
+  mcp-data:
+  caddy-data:
+  caddy-config:

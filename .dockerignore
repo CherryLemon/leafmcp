@@ -1,0 +1,17 @@
+# Keep the build context small: without this, node_modules and the npm cache (~250 MB
+# together) are shipped to the daemon on every build, even though the Dockerfile never
+# copies them.
+node_modules
+dist
+data
+.npmcache
+.git
+
+# Never send credentials into the build context.
+.env
+.env.*
+!.env.example
+
+test
+*.log
+.DS_Store
