@@ -16,6 +16,7 @@
 // dependency is evaluated. See the comment in bootstrap.ts.
 import './bootstrap.js';
 
+import AdmZip from 'adm-zip';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
@@ -162,30 +163,106 @@ async function runHttp(config: AppConfig): Promise<void> {
  * ("it says something went wrong"), so being able to test the Overleaf half in isolation is
  * what turns a vague failure into a one-line fix.
  */
-async function verifyOverleaf(config: AppConfig): Promise<void> {
-  process.stdout.write(`Connecting to ${config.overleaf.baseUrl} …\n`);
+/**
+ * Exercise every Overleaf capability this server depends on, read-only, and report each one.
+ *
+ * The point is diagnosis. In a chat window a broken cookie and an incompatible upstream look
+ * identical — "something went wrong" — so the useful failure is the one that says *which*
+ * call failed. Nothing here writes: no file is uploaded, no comment is posted, and the
+ * project is untouched.
+ *
+ * `--compile` adds the one slow check, since a LaTeX build takes tens of seconds and is the
+ * only step that is not instant.
+ */
+async function verifyOverleaf(config: AppConfig, options: { compile: boolean }): Promise<void> {
   const session = new OverleafSession(config.overleaf);
+  let failures = 0;
 
-  const projects = await session.run((client) => client.listProjects());
-  process.stdout.write(`\nAuthenticated. ${projects.length} project(s):\n\n`);
-  for (const project of projects.slice(0, 25)) {
-    process.stdout.write(`  ${project.name}\n    ${project.id}   updated ${project.lastUpdated?.slice(0, 10) ?? '?'}\n`);
-  }
-  if (projects.length > 25) {
-    process.stdout.write(`  … and ${projects.length - 25} more\n`);
+  const pass = (label: string, detail?: string): void => {
+    process.stdout.write(`  ok    ${label}${detail ? ` — ${detail}` : ''}\n`);
+  };
+  const fail = (label: string, error: unknown): void => {
+    failures += 1;
+    process.stdout.write(`  FAIL  ${label} — ${errorMessage(error)}\n`);
+  };
+  const step = async <T>(label: string, run: () => Promise<T>, detail?: (value: T) => string): Promise<T | undefined> => {
+    try {
+      const value = await run();
+      pass(label, detail?.(value));
+      return value;
+    } catch (error) {
+      fail(label, error);
+      return undefined;
+    }
+  };
+
+  process.stdout.write(`Overleaf at ${config.overleaf.baseUrl}, read-only checks\n\n`);
+
+  const projects = await step('sign in and list projects', () => session.run((c) => c.listProjects()),
+    (list) => `${list.length} project(s)`);
+  if (!projects) {
+    process.stdout.write('\nThe session cookie is the usual cause. Re-copy overleaf_session2 from\n');
+    process.stdout.write('DevTools → Application → Cookies while logged in, then set OVERLEAF_SESSION.\n');
+    process.exitCode = 1;
+    return;
   }
 
-  if (config.defaultProject) {
-    const match = projects.find(
-      (p) => p.id === config.defaultProject || p.name === config.defaultProject,
-    );
-    process.stdout.write(
-      match
-        ? `\nOVERLEAF_DEFAULT_PROJECT resolves to "${match.name}".\n`
-        : `\nWARNING: OVERLEAF_DEFAULT_PROJECT="${config.defaultProject}" matches no project.\n`,
-    );
+  if (projects.length === 0) {
+    process.stdout.write('\nThe account has no projects, so nothing further can be checked.\n');
+    return;
   }
-  process.stdout.write('\nOverleaf side is working.\n');
+
+  // Prefer the configured default so the check runs against the project that will actually be used.
+  const target =
+    projects.find((p) => p.id === config.defaultProject || p.name === config.defaultProject) ?? projects[0];
+  if (!target) return;
+  process.stdout.write(`\n  project: ${target.name} (${target.id})\n\n`);
+
+  const info = await step('project metadata', () => session.run((c) => c.getProjectInfo(target.id)),
+    (value) => `${value.rootFolder.length} top-level entr(ies)`);
+  if (!info) {
+    process.stdout.write('\nWithout project metadata nothing else can be checked.\n');
+    process.exitCode = 1;
+    return;
+  }
+
+  // The archive is what `pull` uses, and it also gives us a real path to fetch individually.
+  const archive = await step('download the project archive', () => session.run((c) => c.downloadProject(target.id)),
+    (buffer) => `${(buffer.length / 1024).toFixed(0)} KB`);
+  let sample: string | undefined;
+  if (archive) {
+    try {
+      const entries = new AdmZip(archive).getEntries().filter((e) => !e.isDirectory);
+      pass('read the archive', `${entries.length} file(s), e.g. ${entries[0]?.entryName ?? '(none)'}`);
+      sample = entries.find((e) => /\.(tex|ltx)$/i.test(e.entryName))?.entryName ?? entries[0]?.entryName;
+    } catch (error) {
+      fail('read the archive', error);
+    }
+  }
+
+  if (sample) {
+    await step(`download a single file (${sample})`, () => session.run((c) => c.downloadByPath(target.id, sample)),
+      (buffer) => `${buffer.length} bytes`);
+  }
+
+  await step('list review comments', () => session.run((c) => c.listComments(target.id, { status: 'all' })),
+    (comments) => `${comments.length} thread(s)`);
+
+  if (options.compile) {
+    process.stdout.write('\n  compiling (this takes a while, and changes nothing)\n');
+    await step('compile the project', () => session.run((c) => c.compileProject(target.id)),
+      (result) => (result.pdfUrl ? 'a PDF was produced' : 'no PDF URL returned'));
+  } else {
+    process.stdout.write('\n  (compilation not checked; pass --compile to include it)\n');
+  }
+
+  process.stdout.write('\n');
+  if (failures === 0) {
+    process.stdout.write('Every check passed. The Overleaf side works.\n');
+    return;
+  }
+  process.stdout.write(`${failures} check(s) failed. Fix those before connecting a client.\n`);
+  process.exitCode = 1;
 }
 
 async function main(): Promise<void> {
@@ -209,7 +286,7 @@ async function main(): Promise<void> {
       return;
     }
     try {
-      await verifyOverleaf(config);
+      await verifyOverleaf(config, { compile: process.argv.includes('--compile') });
     } catch (error) {
       log.error(`Overleaf rejected the credentials: ${errorMessage(error)}`);
       process.stdout.write(

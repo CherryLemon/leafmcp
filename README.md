@@ -134,14 +134,29 @@ openssl rand -base64 24   # generate the OAuth approval passphrase
 npm install
 npm run build
 
-node dist/index.js --check     # validate config, list every problem, start nothing
-node dist/index.js --verify    # validate Overleaf credentials only, list your projects
-node dist/index.js             # start the server
+node dist/index.js --check              # validate config, list every problem, start nothing
+node dist/index.js --verify             # exercise every Overleaf call this server makes
+node dist/index.js --verify --compile   # ... and include a LaTeX build
+node dist/index.js                      # start the server
 ```
 
-> **Debug in this order.** Run `--verify` first to confirm the Overleaf half works, *then*
-> connect a client. From inside a chat window, a bad cookie and a broken MCP setup look
-> identical.
+> **Debug in this order.** Run `--verify` before connecting anything: from inside a chat
+> window a bad cookie, an incompatible upstream and a broken MCP setup all look the same
+> ("something went wrong"). The verifier does not write — no upload, no comment — and reports
+> each capability separately, so a failure names the call that broke:
+>
+> ```
+>   ok    sign in and list projects — 12 project(s)
+>   ok    project metadata — 4 top-level entr(ies)
+>   ok    download the project archive — 812 KB
+>   ok    read the archive — 37 file(s), e.g. main.tex
+>   ok    download a single file (main.tex) — 9134 bytes
+>   ok    list review comments — 2 thread(s)
+> ```
+
+**For a first run, use a project you can afford to lose, and set `OLMCP_READ_ONLY=true`.**
+Nothing here has been exercised against a live account, so treat the first session as a test
+of the bridge itself rather than a real editing session.
 
 ### 4. Run the tests
 
@@ -451,6 +466,7 @@ are skipped rather than extracted.
 | Connection times out | Requests come from the vendors' clouds. Check for an IPv4 `A` record, a valid certificate, and no firewall rule limited to your own IP. Anthropic's egress range is `160.79.104.0/21`. |
 | Consent page will not open, or authorization fails | `PUBLIC_URL` must match the address clients use **exactly**. The `resource` in the discovery metadata must equal the MCP URL precisely; clients validate it strictly. |
 | Tools fail with a session error | `overleaf_session2` changes when you log out or the session expires. Copy it again. Self-hosted instances can set `OVERLEAF_EMAIL` / `OVERLEAF_PASSWORD` for automatic re-login. |
+| Not sure which part is broken | Run `node dist/index.js --verify`. It reports each Overleaf call separately and writes nothing, so the failing line names the problem. |
 | Changes do not appear in Overleaf | Check `pending_changes`. If `OLMCP_AUTO_PUSH=false`, you need an explicit `publish_changes`. Failed files are listed with reasons in the tool result. |
 | Compile fails but the local file looks fine | `compile` publishes first and reports an error rather than compiling stale content. Check `pending_changes`. |
 
