@@ -4,7 +4,12 @@ import { z } from 'zod';
 
 import { ToolError } from '../util/errors.js';
 import { parseLatexLog, renderLogSummary } from '../overleaf/latexlog.js';
-import { formatChanges, readyWorkspace } from './shared.js';
+import {
+  formatChanges,
+  readyWorkspace,
+  requireProjectArg,
+  requiredProject,
+} from './shared.js';
 import { assertWritable, defineTool } from './types.js';
 import type { ToolContext } from './types.js';
 import type { ProjectWorkspace } from '../overleaf/workspace.js';
@@ -44,11 +49,11 @@ export const buildTools = [
       'Use after editing to check the document still builds.',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     inputSchema: {
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: requiredProject,
       resource_path: z.string().optional().describe('Main .tex path for multi-document projects.'),
     },
     async run(ctx, args) {
-      const { project, workspace } = await readyWorkspace(ctx, args.project);
+      const { project, workspace } = await requireProjectArg(ctx, args.project, 'compile');
       const note = await ensurePublished(ctx, workspace);
 
       const result = await ctx.session.run((client) =>
@@ -70,11 +75,11 @@ export const buildTools = [
       'Only needed when auto-publish is disabled or a previous publish failed.',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     inputSchema: {
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: requiredProject,
     },
     async run(ctx, args) {
       assertWritable(ctx, 'publishing changes');
-      const { project, workspace } = await readyWorkspace(ctx, args.project);
+      const { project, workspace } = await requireProjectArg(ctx, args.project, 'publish_changes');
       const outcome = await ctx.session.run((client) => workspace.push(client));
 
       if (outcome.clean) return `Nothing to publish — "${project.name}" already matches Overleaf.`;
@@ -102,12 +107,12 @@ export const buildTools = [
       'edited the project, or to discard local changes.',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     inputSchema: {
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: requiredProject,
       force: z.boolean().optional().describe('Discard unpushed local edits. Default false.'),
     },
     async run(ctx, args) {
       assertWritable(ctx, 'reloading the project');
-      const { project, workspace } = await readyWorkspace(ctx, args.project);
+      const { project, workspace } = await requireProjectArg(ctx, args.project, 'pull_project');
       const { fileCount } = await ctx.session.run((client) =>
         workspace.pull(client, { force: args.force ?? false }),
       );
@@ -145,12 +150,12 @@ export const buildTools = [
       'Reverse the last N edits made through this server and publish the reversal to Overleaf.',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     inputSchema: {
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: requiredProject,
       steps: z.number().int().positive().max(20).optional().describe('How many edits to reverse. Default 1.'),
     },
     async run(ctx, args) {
       assertWritable(ctx, 'undoing edits');
-      const { project, workspace } = await readyWorkspace(ctx, args.project);
+      const { project, workspace } = await requireProjectArg(ctx, args.project, 'undo_last_edit');
       const { reverted } = await workspace.undo(args.steps ?? 1);
       const outcome = await ctx.session.run((client) => workspace.push(client));
       const detail =

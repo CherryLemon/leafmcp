@@ -15,7 +15,7 @@
 import { createServer } from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
 import { strict as assert } from 'node:assert';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -57,6 +57,48 @@ function check(label, condition, detail) {
 
 function section(title) {
   process.stdout.write(`\n${title}\n`);
+}
+
+/**
+ * Walk the full authorization-code + PKCE flow and return the issued tokens.
+ *
+ * Used more than once because replaying a refresh token now revokes its entire grant, so a
+ * test that checks revocation destroys the tokens it was holding.
+ */
+async function authorizeAndExchange({ base, clientId, redirectUri, scope, password }) {
+  const verifier = randomBytes(32).toString('base64url');
+  const challenge = createHash('sha256').update(verifier).digest('base64url');
+  const query = new URLSearchParams({
+    response_type: 'code',
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    state: 'state',
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    scope,
+    resource: 'https://mcp.example.com/mcp',
+  });
+
+  const approved = await fetch(`${base}/oauth/authorize`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ ...Object.fromEntries(query), password }),
+    redirect: 'manual',
+  });
+  const code = new URL(approved.headers.get('location')).searchParams.get('code');
+
+  const response = await fetch(`${base}/oauth/token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      code_verifier: verifier,
+    }),
+  });
+  return response.json();
 }
 
 // ── boot the app ─────────────────────────────────────────────────────────────
@@ -257,6 +299,14 @@ try {
   const rotated = await refreshed.json();
   check('rotation issues a new refresh token', rotated.refresh_token !== tokens.refresh_token);
 
+  // The successor must work before we test that replaying the predecessor kills it.
+  const stillValid = await fetch(`${base}/mcp`, {
+    method: 'POST',
+    headers: { ...MCP_HEADERS, authorization: `Bearer ${rotated.access_token}` },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 90, method: 'tools/list' }),
+  });
+  check('the rotated access token works before the replay', stillValid.status === 200, String(stillValid.status));
+
   const reuse = await fetch(`${base}/oauth/token`, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -268,10 +318,42 @@ try {
   });
   check('consumed refresh token is rejected', reuse.status === 400, String(reuse.status));
 
+  // Replaying a rotated token means the credential leaked, so RFC 9700 wants the whole grant
+  // revoked. Checking only that the *old* token fails would pass even if revocation did
+  // nothing at all — the old token is marked used either way. What has to die is the
+  // successor the legitimate client is holding right now.
+  const afterReplay = await fetch(`${base}/mcp`, {
+    method: 'POST',
+    headers: { ...MCP_HEADERS, authorization: `Bearer ${rotated.access_token}` },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 91, method: 'tools/list' }),
+  });
+  check('replay revokes the whole grant, including its access token', afterReplay.status === 401, String(afterReplay.status));
+
+  const successorRefresh = await fetch(`${base}/oauth/token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: rotated.refresh_token,
+      client_id: client.client_id,
+    }),
+  });
+  check('replay revokes the successor refresh token too', successorRefresh.status === 400, String(successorRefresh.status));
+
+  // ── a fresh grant for the MCP session tests ────────────────────────────────
+  const sessionTokens = await authorizeAndExchange({
+    base,
+    clientId: client.client_id,
+    redirectUri: CLAUDE_CALLBACK,
+    scope: 'overleaf.read overleaf.write',
+    password: PASS,
+  });
+  check('a fresh authorization still works after a revocation', typeof sessionTokens.access_token === 'string');
+
   // ── authenticated MCP session ──────────────────────────────────────────────
   section('MCP session over the authenticated endpoint');
 
-  const authHeaders = { ...MCP_HEADERS, authorization: `Bearer ${rotated.access_token}` };
+  const authHeaders = { ...MCP_HEADERS, authorization: `Bearer ${sessionTokens.access_token}` };
 
   const unregistered = await fetch(`${base}/mcp`, { method: 'GET', headers: authHeaders });
   check('GET /mcp answers 405 with Allow: POST', unregistered.status === 405 && unregistered.headers.get('allow') === 'POST');
@@ -507,7 +589,7 @@ try {
     },
   };
 
-  const ws = new ProjectWorkspace(join(dataDir, 'projects'), 'proj123', 'Smoke Thesis', {
+  const ws = new ProjectWorkspace(dataDir, 'proj123', 'Smoke Thesis', {
     maxFileBytes: 1024 * 1024,
   });
   const pulled = await ws.pull(fakeClient);
@@ -648,7 +730,7 @@ try {
   const compileTool = buildTools.find((tool) => tool.name === 'compile');
   let compileRefused = false;
   try {
-    await compileTool.run(readOnlyCtx, {});
+    await compileTool.run(readOnlyCtx, { project: 'proj123' });
   } catch {
     compileRefused = true;
   }
@@ -672,6 +754,207 @@ try {
     refusedMassDelete = true;
   }
   check('push refuses to delete every file in the project', refusedMassDelete);
+
+  // ── regression: git metadata is out of reach ───────────────────────────────
+  section('Regression — git metadata cannot be reached through the file tools');
+
+  // Writing `.git/config` used to be a command-execution primitive, not just repository
+  // corruption: git runs programs named by `core.fsmonitor`, `core.hooksPath` and
+  // `filter.*.clean`, and `git add -A` is enough to trigger them. Verified against git 2.47
+  // before the fix. Two independent controls now cover it.
+  for (const reserved of ['.git/config', '.git/hooks/pre-commit', 'sections/.git/config', '.gitattributes', '.gitmodules', '.GIT/config']) {
+    let rejected = false;
+    try {
+      normalizeRelPath(reserved);
+    } catch {
+      rejected = true;
+    }
+    check(`path guard rejects ${reserved}`, rejected);
+  }
+  check('ordinary paths still work', normalizeRelPath('sections/intro.tex') === 'sections/intro.tex');
+
+  const hostileZip = new AdmZip();
+  hostileZip.addFile('main.tex', Buffer.from('\\documentclass{article}\n'));
+  hostileZip.addFile('.git/config', Buffer.from('[core]\n\thooksPath = /tmp/lm-hooks\n'));
+  hostileZip.addFile('nested/.git/hooks/pre-commit', Buffer.from('#!/bin/sh\ntouch /tmp/lm-PWNED\n'));
+
+  const ws2 = new ProjectWorkspace(dataDir, 'gitprobe', 'Git Probe', { maxFileBytes: 1024 * 1024 });
+  const hostileClient = {
+    downloadProject: async () => hostileZip.toBuffer(),
+    uploadFile: async () => ({ success: true }),
+    deleteByPath: async () => undefined,
+    invalidateFolderTree: () => undefined,
+  };
+  const pulledHostile = await ws2.pull(hostileClient);
+  check('archive entries under .git are skipped', pulledHostile.fileCount === 1, String(pulledHostile.fileCount));
+  check('the work tree holds only project files', ws2.listFiles().join(',') === 'main.tex', ws2.listFiles().join(','));
+  check('the work tree contains no .git directory', !existsSync(join(ws2.dir, '.git')));
+  check('the git directory lives outside the work tree', ws2.gitDir.startsWith(join(dataDir, 'meta')) && !ws2.gitDir.startsWith(ws2.dir), ws2.gitDir);
+  check('the planted hook never ran', !existsSync('/tmp/lm-PWNED'));
+  check('the mirror is still a working repository', (await ws2.changes()).length === 0);
+
+  // ── regression: a failed pull must not damage the mirror ───────────────────
+  section('Regression — a failed pull leaves the mirror intact');
+
+  // An archive with `a` as a file and `a/b` as a file cannot be extracted: creating the
+  // parent directory for `a/b` fails because `a` is already a file. Before the fix, `pull`
+  // wiped the work tree *first*, so this left a partial tree that the next push read as
+  // "these files were deleted" and removed from Overleaf.
+  const clashZip = new AdmZip();
+  clashZip.addFile('a', Buffer.from('file named a\n'));
+  clashZip.addFile('a/b', Buffer.from('nested under a file\n'));
+  clashZip.addFile('keep.tex', Buffer.from('should survive\n'));
+
+  const ws3 = new ProjectWorkspace(dataDir, 'pullprobe', 'Pull Probe', { maxFileBytes: 1024 * 1024 });
+  const goodZip = new AdmZip();
+  goodZip.addFile('precious.tex', Buffer.from('\\section{Do not lose me}\n'));
+  goodZip.addFile('notes.bib', Buffer.from('@book{x}\n'));
+  let currentZip = goodZip;
+  const switcher = {
+    downloadProject: async () => currentZip.toBuffer(),
+    uploadFile: async () => ({ success: true }),
+    deleteByPath: async () => undefined,
+    invalidateFolderTree: () => undefined,
+  };
+  await ws3.pull(switcher);
+  check('the mirror starts with the good content', ws3.listFiles().length === 2, JSON.stringify(ws3.listFiles()));
+
+  currentZip = clashZip;
+  let pullFailed = false;
+  try {
+    await ws3.pull(switcher, { force: true });
+  } catch {
+    pullFailed = true;
+  }
+  check('a malformed archive makes the pull fail', pullFailed);
+  check(
+    'the previous files are still there after the failed pull',
+    ws3.listFiles().join(',') === 'notes.bib,precious.tex',
+    ws3.listFiles().join(','),
+  );
+  check('no partial tree was left behind', !existsSync(`${ws3.dir}.incoming`));
+  check('no leftover backup directory', !existsSync(`${ws3.dir}.old`));
+  check('the failed pull changed nothing remotely', (await ws3.changes()).length === 0);
+
+  // ── regression: a failed upload must not be followed by deletes ────────────
+  section('Regression — a failed upload cancels the deletions');
+
+  // A rename is an upload plus a delete. If the upload fails and the delete proceeds, the
+  // project loses the old file without gaining the new one.
+  const ws4 = new ProjectWorkspace(dataDir, 'pushprobe', 'Push Probe', { maxFileBytes: 1024 * 1024 });
+  const renameZip = new AdmZip();
+  renameZip.addFile('old-name.tex', Buffer.from('\\section{Original}\n'));
+  const attempts = [];
+  const flakyClient = {
+    downloadProject: async () => renameZip.toBuffer(),
+    uploadFile: async (_p, _f, name) => {
+      attempts.push(name);
+      if (name === 'new-name.tex') throw new Error('simulated upload failure');
+      return { success: true };
+    },
+    deleteByPath: async (_p, path) => {
+      attempts.push(`delete:${path}`);
+    },
+    invalidateFolderTree: () => undefined,
+  };
+  await ws4.pull(flakyClient);
+  await ws4.movePath('old-name.tex', 'new-name.tex');
+
+  const deferred = await ws4.push(flakyClient);
+  check('the upload was attempted', attempts.includes('new-name.tex'), JSON.stringify(attempts));
+  check('the failed upload is reported', deferred.failed.some((f) => f.path === 'new-name.tex'));
+  check('the deletion was held back', deferred.deletionsDeferred === true);
+  check('no delete reached Overleaf', !attempts.includes('delete:old-name.tex'), JSON.stringify(attempts));
+  check('the rename is still pending', (await ws4.changes()).length === 2, JSON.stringify(await ws4.changes()));
+
+  // ── regression: edits must be literal ──────────────────────────────────────
+  section('Regression — replacement text is inserted literally');
+
+  // `String.replace` expands `$$`, `$&` and `$1` in the replacement, which turned
+  // `$$E = mc^2$$` into `$E = mc^2$` — display math silently destroyed by the one tool whose
+  // whole job is editing LaTeX.
+  const { fileTools } = await import('../dist/tools/files.js');
+  const editTool = fileTools.find((tool) => tool.name === 'edit_file');
+
+  const ws5 = new ProjectWorkspace(dataDir, 'editprobe', 'Edit Probe', { maxFileBytes: 1024 * 1024 });
+  const plainZip = new AdmZip();
+  plainZip.addFile('main.tex', Buffer.from('BEFORE\nMARKER\nAFTER\n'));
+  await ws5.pull({
+    downloadProject: async () => plainZip.toBuffer(),
+    uploadFile: async () => ({ success: true }),
+    deleteByPath: async () => undefined,
+    invalidateFolderTree: () => undefined,
+  });
+
+  const editCtx = {
+    config: { ...config, autoPush: false, readOnly: false, freshReads: false },
+    readOnly: false,
+    session: { run: (fn) => fn({}) },
+    registry: { resolve: async () => ({ id: 'editprobe', name: 'Edit Probe' }) },
+    workspaces: { for: () => ws5 },
+  };
+
+  const latexMath = '$$E = mc^2$$';
+  await editTool.run(editCtx, { path: 'main.tex', old_text: 'MARKER', new_text: latexMath, project: 'editprobe' });
+  const edited = await ws5.read('main.tex');
+  check('display math survives an edit', edited.includes(latexMath), JSON.stringify(edited));
+
+  await editTool.run(editCtx, { path: 'main.tex', old_text: latexMath, new_text: 'back to $& and $1', project: 'editprobe' });
+  const escaped = await ws5.read('main.tex');
+  check('`$&` in replacement text is literal', escaped.includes('back to $& and $1'), JSON.stringify(escaped));
+
+  let projectRequired = false;
+  try {
+    await editTool.run(editCtx, { path: 'main.tex', old_text: 'BEFORE', new_text: 'x' });
+  } catch {
+    projectRequired = true;
+  }
+  check('edit_file refuses to run without an explicit project', projectRequired);
+
+  // ── regression: a catastrophic pattern cannot wedge the server ─────────────
+  section('Regression — an expensive pattern is terminated, not waited on');
+
+  const { searchIsolated } = await import('../dist/tools/search.js');
+  await ws5.write('hang.tex', `${'a'.repeat(80)}b\n`);
+
+  const startedAt = Date.now();
+  const doomed = await searchIsolated({
+    root: ws5.dir,
+    files: ['hang.tex'],
+    skip: [],
+    pattern: '(a|aa)+$',
+    isRegex: true,
+    caseSensitive: false,
+    maxResults: 10,
+    lineCap: 4000,
+    timeoutMs: 1500,
+  });
+  const elapsed = Date.now() - startedAt;
+
+  check('the runaway search was terminated', doomed.timedOut === true);
+  check('the caller got control back promptly', elapsed < 6000, `${elapsed}ms`);
+  check('no results were fabricated', doomed.hits.length === 0);
+
+  // Sanity: the same file with a literal search is instant, so the timeout is specific to the
+  // pathological pattern rather than to the search machinery.
+  const literal = await searchIsolated({
+    root: ws5.dir,
+    files: ['hang.tex'],
+    skip: [],
+    pattern: 'aaaa',
+    isRegex: false,
+    caseSensitive: false,
+    maxResults: 10,
+    lineCap: 4000,
+    timeoutMs: 1500,
+  });
+  check('a literal search over the same file is fine', literal.timedOut === false && literal.hits.length === 1);
+
+  // ── regression: the token store is not world-readable ──────────────────────
+  section('Regression — OAuth state file permissions');
+
+  const storeMode = statSync(join(dataDir, 'oauth.json')).mode & 0o777;
+  check('the token store is owner-only (0600)', storeMode === 0o600, `mode ${storeMode.toString(8)}`);
 } finally {
   await new Promise((resolve) => server.close(resolve));
   rmSync(dataDir, { recursive: true, force: true });

@@ -31,12 +31,13 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "node --experimental-transform-types src/index.ts",
+    "dev": "npm run build && node --watch dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node test/smoke.mjs",
     "smoke": "node test/smoke.mjs",
     "check": "node dist/index.js --check",
-    "verify": "node dist/index.js --verify"
+    "verify": "node dist/index.js --verify",
+    "build:watch": "tsc --watch --preserveWatchOutput"
   },
   "dependencies": {
     "@aloth/olcli": "^0.13.1",

@@ -9,7 +9,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 import { log } from '../util/logger.js';
@@ -44,8 +44,22 @@ export interface TokenRecord {
   resource?: string;
   expires_at: number;
   created_at: number;
-  /** Refresh tokens are rotated: the old one is dropped the moment it is redeemed. */
-  parent?: string;
+  /**
+   * Identifier shared by every token descended from one authorization.
+   *
+   * Refresh rotation only helps if a replayed token can be traced back to the grant it came
+   * from, and access tokens have to be reachable from that same grant — otherwise revoking
+   * the chain leaves a working access token behind, which is the opposite of the point.
+   */
+  family: string;
+  /**
+   * Refresh tokens are marked used rather than deleted.
+   *
+   * Deleting on use makes a replay indistinguishable from an unknown token, so the server
+   * can only say "no" — it cannot notice that a credential has leaked and revoke the
+   * successor tokens, which is what RFC 9700 asks for.
+   */
+  status?: 'active' | 'used';
 }
 
 interface StoreShape {
@@ -101,10 +115,13 @@ export class OAuthStore {
   }
 
   private async writeNow(): Promise<void> {
-    await mkdir(dirname(this.path), { recursive: true });
+    await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     const tmp = `${this.path}.tmp`;
-    await writeFile(tmp, `${JSON.stringify(this.data, null, 2)}\n`, 'utf8');
+    // 0600: this file holds live access and refresh tokens, so it must not be readable by
+    // anything else on the machine. The rename below carries the mode onto the final file.
+    await writeFile(tmp, `${JSON.stringify(this.data, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     await rename(tmp, this.path);
+    await chmod(this.path, 0o600).catch(() => undefined);
   }
 
   private prune(): void {
@@ -169,20 +186,28 @@ export class OAuthStore {
   }
 
   /**
-   * Atomically consume a token, returning it to exactly one caller.
+   * Atomically consume a refresh token, returning it to exactly one caller.
    *
-   * The delete happens synchronously after the (single) `await this.load()`, before any
-   * further suspension point, so two concurrent refreshes holding the same token cannot
-   * both proceed. A read-then-delete across separate awaits would let both mint new tokens
-   * from one credential.
+   * The status flip happens synchronously after the single `await this.load()`, before any
+   * further suspension point, so two concurrent refreshes holding the same token cannot both
+   * proceed. A read-then-write across separate awaits would let both mint new tokens from one
+   * credential.
+   *
+   * The record is kept (marked `used`) so a later replay is recognisable; see `TokenRecord`.
    */
   async claimToken(token: string): Promise<TokenRecord | undefined> {
     await this.load();
     const record = this.data.tokens[token];
     if (!record) return undefined;
-    delete this.data.tokens[token];
+    if (record.expires_at <= Date.now()) {
+      delete this.data.tokens[token];
+      await this.persist();
+      return undefined;
+    }
+    if (record.status === 'used') return undefined;
+    record.status = 'used';
     await this.persist();
-    return record.expires_at > Date.now() ? record : undefined;
+    return record;
   }
 
   async deleteToken(token: string): Promise<void> {
@@ -193,16 +218,24 @@ export class OAuthStore {
     }
   }
 
-  /** Drop a refresh token and everything minted from it (rotation hygiene). */
-  async revokeFamily(refreshToken: string): Promise<void> {
+  /**
+   * Delete every token descended from one authorization.
+   *
+   * This is the response to a replayed refresh token: the credential has leaked, so the
+   * whole grant goes — access tokens included — and the user re-authorizes. Removing the
+   * access tokens is what makes the revocation take effect immediately rather than whenever
+   * the next access token happens to expire.
+   */
+  async revokeFamily(family: string): Promise<number> {
     await this.load();
-    let changed = false;
+    let removed = 0;
     for (const [token, record] of Object.entries(this.data.tokens)) {
-      if (token === refreshToken || record.parent === refreshToken) {
+      if (record.family === family) {
         delete this.data.tokens[token];
-        changed = true;
+        removed += 1;
       }
     }
-    if (changed) await this.persist();
+    if (removed > 0) await this.persist();
+    return removed;
   }
 }

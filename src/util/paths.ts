@@ -1,14 +1,33 @@
 /** Path handling for tool arguments, which are attacker-influenced (the model writes them). */
 
 import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { lstat } from 'node:fs/promises';
 import { ToolError } from './errors.js';
+
+/**
+ * Names the model may never read or write, anywhere in the tree.
+ *
+ * `.git` is the important one. Git configuration is executable — `core.fsmonitor`,
+ * `core.hooksPath` and `filter.*.clean` all run programs as a side effect of ordinary
+ * commands — so a writable `.git/config` inside a repository we then run git in is a command
+ * execution primitive, not merely a corrupt repository. The git directory is also kept
+ * outside the work tree (see `util/git.ts`); this rule is the second layer, so that a future
+ * refactor cannot quietly reintroduce the reachable path.
+ *
+ * The other `.git*` names are blocked with it because they shape git's behaviour
+ * (`.gitattributes` can attach a filter, `.gitmodules` can pull in another repository) and
+ * an assistant editing a paper has no reason to touch any of them.
+ */
+function isReservedSegment(segment: string): boolean {
+  return segment.toLowerCase().startsWith('.git');
+}
 
 /**
  * Normalize a model-supplied project-relative path.
  *
- * Rejects absolute paths, drive letters, UNC prefixes and any `..` segment. The model is
- * told to use paths like `sections/intro.tex`; anything else is a bug or an injection
- * attempt, and either way must not reach the filesystem.
+ * Rejects absolute paths, drive letters, UNC prefixes, any `..` segment, and the reserved
+ * git names above. The model is told to use paths like `sections/intro.tex`; anything else
+ * is a bug or an injection attempt, and either way must not reach the filesystem.
  */
 export function normalizeRelPath(input: string): string {
   if (typeof input !== 'string' || input.trim() === '') {
@@ -25,6 +44,12 @@ export function normalizeRelPath(input: string): string {
   if (segments.some((s) => s === '..')) {
     throw new ToolError(`path must not contain "..", got "${input}"`);
   }
+  if (segments.some(isReservedSegment)) {
+    throw new ToolError(
+      `"${input}" is not a project file: git metadata is not accessible through these tools`,
+      'Only files that belong to the LaTeX project can be read or written.',
+    );
+  }
   if (segments.length === 0) {
     throw new ToolError(`path "${input}" does not name a file`);
   }
@@ -40,6 +65,42 @@ export function safeJoin(root: string, relPath: string): string {
     throw new ToolError(`path "${relPath}" escapes the project directory`);
   }
   return target;
+}
+
+/**
+ * Like `safeJoin`, but for archive entries: returns null instead of throwing.
+ *
+ * Extraction must skip a bad entry and carry on rather than abort the whole import, and it
+ * needs the same two guarantees — no escape, and no git metadata — because an archive is
+ * attacker-controlled input too.
+ */
+export function safeArchiveEntry(root: string, entryName: string): string | null {
+  try {
+    return safeJoin(root, entryName);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Refuse to operate on a path that is a symbolic link.
+ *
+ * We never create symlinks, so one appearing in the mirror means it was placed there by
+ * something else, and following it would let a write land outside the project.
+ */
+export async function assertNotSymlink(path: string): Promise<void> {
+  try {
+    const info = await lstat(path);
+    if (info.isSymbolicLink()) {
+      throw new ToolError(
+        `refusing to write through the symbolic link "${path}"`,
+        'Remove the link and use a regular project file instead.',
+      );
+    }
+  } catch (error) {
+    if (error instanceof ToolError) throw error;
+    // ENOENT is the normal case: the file does not exist yet.
+  }
 }
 
 /** Path of `target` relative to `root`, always with forward slashes. */

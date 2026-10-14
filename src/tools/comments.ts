@@ -9,7 +9,11 @@
 import { z } from 'zod';
 
 import { ToolError } from '../util/errors.js';
-import { readyWorkspace } from './shared.js';
+import {
+  readyWorkspace,
+  requireProjectArg,
+  requiredProject,
+} from './shared.js';
 import { assertWritable, defineTool } from './types.js';
 
 const STATUS = z.enum(['all', 'open', 'resolved']).optional().describe('Filter by thread status. Default open.');
@@ -60,11 +64,11 @@ export const commentTools = [
       content: z.string().min(1).describe('Comment text.'),
       line: z.number().int().positive().optional().describe('1-based line to anchor the comment to.'),
       selected_text: z.string().optional().describe('Exact text being commented on.'),
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: requiredProject,
     },
     async run(ctx, args) {
       assertWritable(ctx, 'adding a comment');
-      const { project } = await readyWorkspace(ctx, args.project);
+      const { project } = await requireProjectArg(ctx, args.project, 'add_comment');
       const comment = await ctx.session.run((client) =>
         client.addComment(project.id, {
           filePath: args.path,
@@ -85,11 +89,11 @@ export const commentTools = [
     inputSchema: {
       thread_id: z.string().describe('Thread id from list_comments (short prefix is accepted).'),
       content: z.string().min(1).describe('Reply text.'),
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: requiredProject,
     },
     async run(ctx, args) {
       assertWritable(ctx, 'replying to a comment');
-      const { project } = await readyWorkspace(ctx, args.project);
+      const { project } = await requireProjectArg(ctx, args.project, 'reply_to_comment');
       const threadId = await resolveThreadId(ctx, project.id, args.thread_id);
       const message = await ctx.session.run((client) =>
         client.postCommentMessage(project.id, threadId, args.content),
@@ -106,11 +110,11 @@ export const commentTools = [
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     inputSchema: {
       thread_id: z.string().describe('Thread id from list_comments (short prefix is accepted).'),
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: requiredProject,
     },
     async run(ctx, args) {
       assertWritable(ctx, 'resolving a comment');
-      const { project } = await readyWorkspace(ctx, args.project);
+      const { project } = await requireProjectArg(ctx, args.project, 'resolve_comment');
       const threadId = await resolveThreadId(ctx, project.id, args.thread_id);
       await ctx.session.run((client) => client.resolveComment(project.id, threadId));
       return `Resolved thread ${threadId.slice(0, 8)}.`;

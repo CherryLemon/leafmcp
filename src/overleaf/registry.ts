@@ -152,8 +152,10 @@ export class WorkspaceManager {
   for(project: ActiveProject): ProjectWorkspace {
     const existing = this.workspaces.get(project.id);
     if (existing) return existing;
+    // The workspace derives both its work tree and its git directory from this root; the two
+    // are kept as siblings so git metadata never appears inside the project files.
     const workspace = new ProjectWorkspace(
-      join(this.config.dataDir, 'projects'),
+      this.config.dataDir,
       project.id,
       project.name,
       { maxFileBytes: this.config.maxFileBytes },

@@ -1,10 +1,30 @@
 /** Helpers shared by the tool handlers: mirror readiness, save-and-publish, formatting. */
 
+import { z } from 'zod';
+
+import { ToolError } from '../util/errors.js';
 import type { ActiveProject } from '../overleaf/registry.js';
 import { EDIT_COMMIT_PREFIX } from '../overleaf/workspace.js';
 import type { PendingChange, ProjectWorkspace } from '../overleaf/workspace.js';
 import type { ToolContext } from './types.js';
 import { assertWritable } from './types.js';
+
+/**
+ * How a mutating tool declares its project argument.
+ *
+ * Required in the schema, not merely enforced at runtime, so the model sees the requirement
+ * while composing the call rather than after it fails. See `requireProjectArg` for why
+ * mutating tools may not fall back to the selected project.
+ */
+export const requiredProject = z
+  .string()
+  .min(1)
+  .describe('Project id or name. Required for tools that change the project.');
+
+export const optionalProject = z
+  .string()
+  .optional()
+  .describe('Project id or name; defaults to the selected project.');
 
 /** Resolve the target project and guarantee its mirror holds the current Overleaf state. */
 export async function readyWorkspace(
@@ -25,6 +45,36 @@ export async function readyWorkspace(
     await ctx.session.run((client) => workspace.pull(client));
   }
   return { project, workspace };
+}
+
+/**
+ * Resolve the project for an operation that changes something.
+ *
+ * Mutating tools never fall back to the deployment-wide "selected project". Several clients
+ * share one server, so a `use_project` call from one of them would otherwise silently
+ * redirect another's edit into a different paper — the model asking for "the intro" would
+ * be told it succeeded while editing a document nobody was looking at.
+ *
+ * Read tools keep the optional fallback: reading the wrong project is visible in the result,
+ * and the cost of a mistake is a wasted call rather than a changed file.
+ */
+export async function requireProjectArg(
+  ctx: ToolContext,
+  projectRef: string | undefined,
+  operation: string,
+): Promise<{ project: ActiveProject; workspace: ProjectWorkspace }> {
+  if (!projectRef || projectRef.trim() === '') {
+    const active = await ctx.registry.active();
+    throw new ToolError(
+      `${operation} needs an explicit project argument`,
+      active
+        ? `Pass project="${active.id}" — the currently selected project is "${active.name}". ` +
+          'Tools that change the project never rely on the selected project, because several ' +
+          'clients share this server and would otherwise edit each other\'s papers.'
+        : 'Call list_projects, then pass the id of the project to change.',
+    );
+  }
+  return readyWorkspace(ctx, projectRef);
 }
 
 /**

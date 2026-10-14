@@ -353,16 +353,20 @@ is **fixed and covered by a regression test** (`npm test`, the `Regression` sect
 
 | Severity | Issue | Fix |
 |---|---|---|
+| **Critical** | `.git` was reachable through the file tools. That is a command-execution primitive rather than mere repository corruption: git runs programs named by `core.fsmonitor`, `core.hooksPath` and `filter.*.clean`, and `git add -A` triggers them — confirmed against git 2.47, where all three vectors executed a payload. A prompt injection reaching one write call would have become code execution on the host. | Git's directory now lives **outside** the work tree (verified: the work tree contains no `.git` at all), the path layer rejects every `.git*` name, archives with such entries are skipped, and the git child runs with a minimal environment, no global config, and hooks and fsmonitor disabled. |
 | **Critical** | Under `MCP_AUTH_MODE=bearer` (the default) the OAuth routes were still mounted, and that mode does not require `MCP_OAUTH_PASSWORD` — so **an empty passphrase matched an empty passphrase**, letting anyone self-register a client, approve it, and mint a token with full account access. | An empty passphrase never authorizes. OAuth routes are mounted only in `oauth` mode, and tokens issued earlier stop working outside it. |
-| **High** | `pull_project` wiped the mirror before writing, so a failure part-way through left a partial tree; the next push read the missing files as deletions and **removed them from Overleaf**. | Extract to a temporary directory and swap atomically, with rollback. A push also refuses to delete every file at once. |
+| **High** | `pull_project` wiped the mirror before writing, so a failure part-way through left a partial tree; the next push read the missing files as deletions and **removed them from Overleaf**. The rollback added in the first fix was itself wrong — it deleted work-tree entries that had not been backed up yet, destroying the files it existed to protect. | Extract to a temporary directory and swap atomically. The rollback removes only what was installed and restores from the backup's actual contents. A push also refuses to delete every file at once. |
 | **High** | `compile` auto-publishes pending edits but was the one write path with no read-only check, so a read-only connection could upload and delete files through it. | Read-only check added. |
+| **High** | Publishing continued into the deletion phase after an upload failed. A rename is an upload plus a delete, so this left the project with neither the new file nor the old one — silent data loss from an operation the user read as a rename. | Any upload failure cancels the deletion phase; the change stays pending and the outcome reports that deletions were held back. |
 | **High** | The consent screen was unthrottled, so the approval passphrase could be brute-forced. | Rate limited. |
 | Medium | `changes()` returned an empty list on a git error (fail-open), silently skipping pushes and disabling the guard that protects unpublished edits. | Now throws (fail-closed). |
 | Medium | `undo_last_edit` would reverse a *reload from Overleaf*, pushing a stale copy over browser edits and reporting success. | Only edit commits are undoable; reloads and refreshes are refused explicitly. |
-| Medium | Refresh tokens could be replayed concurrently (both requests minted new tokens), and a wrong `parent` field meant family revocation never matched. | Atomic claim (take-and-delete); `parent` now points at the replaced refresh token. |
+| Medium | Refresh tokens could be replayed concurrently (both requests minted new tokens), and family revocation never actually matched — so a replayed token was merely refused while the stolen successor kept full access, contradicting what the README claimed. | Tokens carry a grant id; the claim is atomic; a replayed token revokes every token in its grant, access tokens included, so revocation is immediate. The regression test asserts the successor dies, not just that the old token is refused. |
 | Medium | `trust proxy: true` trusted every proxy, so `X-Forwarded-For` could be spoofed to evade rate limiting. | Configurable hop count (default 1); `true` is unreachable. |
 | Medium | A failed write permanently poisoned the OAuth store's write chain, breaking all later writes. | The chain stays settled; a single failure no longer propagates. |
 | Medium | `search_project` compiled a model-supplied regex and ran it per line on the event loop, so catastrophic backtracking hung the whole server. | Nested-quantifier patterns rejected, plus a per-line cap and a time budget. |
+| Medium | `edit_file` passed replacement text through `String.replace`, which expands `$$`, `$&` and `$1`. Writing `$$E = mc^2$$` produced `$E = mc^2$` — display math silently destroyed by the one tool whose job is editing LaTeX. The two replacement branches also disagreed. | A function replacer makes the text literal in both branches. |
+| Medium | The ReDoS guard was a heuristic for nested quantifiers, and `(a|aa)+$` walked past it. Measured: 36 characters took ~6 seconds and 40 never finished, against a 4,000-character line cap — so one line of one file could wedge every request. | Regex evaluation moved into a killable child process with a hard deadline, which is the only thing that stops a match already running. |
 | Low | `use_project` had no read-only check and writes global state, so a read-only connection could retarget another client's edits. | Read-only check added. |
 | Low | `MCP_AUTH_MODE=none` granted anonymous write access. | Read-only by default; requires `OLMCP_ALLOW_ANONYMOUS_WRITE=true` to opt in. |
 | Low | Static tokens were compared in non-constant time; redaction missed custom cookie names; successful tool output bypassed redaction. | Constant-time comparison, runtime-registered secrets, output redacted too. |
@@ -390,11 +394,25 @@ Set `LOG_LEVEL=debug` to see per-call timings and failure reasons.
 
 ```bash
 npm install
-npm run typecheck     # types only
-npm run build         # compile to dist/
-npm test              # build, then the full end-to-end suite
-npm run dev           # run the TypeScript sources directly
+npm run typecheck      # types only
+npm run build          # compile to dist/
+npm test               # build, then the full end-to-end suite
+npm start              # run the built server
 ```
+
+For a development loop, run these in two terminals:
+
+```bash
+npm run build:watch    # tsc --watch
+npm run dev            # builds once, then restarts on every rebuild
+```
+
+Everything runs from `dist/`. Node's built-in type stripping does not rewrite the `./x.js`
+import specifiers that `tsc` requires in ESM output, so running `src/` directly needs an extra
+resolve hook or a runner such as `tsx` — this project stays on plain `tsc` output rather than
+adding a dependency for it. The one exception is the search worker
+(`src/tools/search-worker.ts`), which imports nothing but Node built-ins so it can also be
+launched from source.
 
 ### Layout
 
@@ -415,8 +433,10 @@ src/
     latex.ts              LaTeX structure and summaries
     latexlog.ts           Compile-log distillation
   tools/                22 tool handlers, decoupled from the MCP framework
+    search.ts             Spawns and supervises the isolated search
+    search-worker.ts      Runs the pattern somewhere it can be killed
   transport/http.ts     Express app: MCP endpoint, OAuth, health check
-test/smoke.mjs          End-to-end suite (116 checks)
+test/smoke.mjs          End-to-end suite (152 checks)
 docker/                 Dockerfile, compose, Caddyfile
 ```
 

@@ -4,14 +4,20 @@
  * The mirror is the unit of work for every read and write tool. That choice buys three
  * things that matter a lot once a model is editing a paper unsupervised:
  *
- *   - "What would a push change?" is answered by git (`refs/overleaf/pushed..worktree`),
+ *   - "What would a push change?" is answered by git (`refs/overleaf/pushed..index`),
  *     not by bookkeeping we could get wrong.
  *   - Every accepted edit is a commit, so `undo` is real rather than best-effort.
  *   - Overleaf's own file-type semantics (docs vs. binary files, nested folders) are
  *     handled once, at pull time, by the zip round trip.
+ *
+ * The work tree holds project files and nothing else. Git's own directory lives beside it,
+ * never inside it, so the file tools an assistant drives cannot reach git metadata — see
+ * `util/git.ts` for why that matters.
  */
 
-// First import, deliberately — see the note in session.ts.
+// First import, deliberately: it redirects the Overleaf client's config directory, and ESM
+// evaluates imports in declaration order — so this has run by the time the import below is
+// evaluated. See bootstrap.ts for the failure this prevents.
 import '../bootstrap.js';
 
 import AdmZip from 'adm-zip';
@@ -28,13 +34,15 @@ import {
 import { ToolError, errorMessage } from '../util/errors.js';
 import {
   commitAll,
+  createRepo,
   git,
   headSha,
   markPushed,
   pushedSha,
+  type GitRepo,
 } from '../util/git.js';
 import { log } from '../util/logger.js';
-import { normalizeRelPath, safeJoin } from '../util/paths.js';
+import { assertNotSymlink, normalizeRelPath, safeArchiveEntry, safeJoin } from '../util/paths.js';
 
 export type ChangeStatus = 'added' | 'modified' | 'deleted';
 
@@ -57,6 +65,8 @@ export interface PushOutcome {
   failed: Array<{ path: string; reason: string }>;
   /** True when nothing was pending. */
   clean: boolean;
+  /** True when deletions were held back because an upload failed. */
+  deletionsDeferred: boolean;
 }
 
 /** Text-ish extensions we are willing to hand to the model directly. */
@@ -73,7 +83,10 @@ export function looksBinary(relPath: string): boolean {
 }
 
 export class ProjectWorkspace {
+  /** The work tree: project files only, exactly what the model may touch. */
   readonly dir: string;
+  /** Git metadata, deliberately a sibling rather than a child of the work tree. */
+  readonly gitDir: string;
 
   constructor(
     private readonly root: string,
@@ -81,21 +94,30 @@ export class ProjectWorkspace {
     readonly projectName: string,
     private readonly limits: { maxFileBytes: number },
   ) {
-    this.dir = join(root, sanitizeSegment(projectId));
+    const segment = sanitizeSegment(projectId);
+    this.dir = join(root, 'projects', segment);
+    this.gitDir = join(root, 'meta', `${segment}.git`);
+  }
+
+  private get repo(): GitRepo {
+    return { gitDir: this.gitDir, workDir: this.dir };
   }
 
   // ── lifecycle ────────────────────────────────────────────────────────────
 
   async ensure(): Promise<void> {
-    await mkdir(this.dir, { recursive: true });
-    if (!existsSync(join(this.dir, '.git'))) {
-      await git(this.dir, ['init', '-q', '-b', 'main'], true);
-      // The container may have no global git identity; scope one to this repo only.
-      await git(this.dir, ['config', 'user.name', 'overleaf-mcp'], true);
-      await git(this.dir, ['config', 'user.email', 'overleaf-mcp@localhost'], true);
-      await git(this.dir, ['config', 'commit.gpgsign', 'false'], true);
-      await git(this.dir, ['config', 'core.autocrlf', 'false'], true);
+    // 0700: these directories hold someone's unpublished papers.
+    await mkdir(this.dir, { recursive: true, mode: 0o700 });
+    await mkdir(dirname(this.gitDir), { recursive: true, mode: 0o700 });
+    if (!existsSync(this.gitDir)) {
+      await createRepo(this.gitDir, this.dir);
     }
+  }
+
+  /** True once the mirror reflects a real Overleaf state (i.e. a pull has completed). */
+  async isInitialized(): Promise<boolean> {
+    if (!existsSync(this.gitDir)) return false;
+    return (await headSha(this.repo)) !== null;
   }
 
   /**
@@ -124,49 +146,42 @@ export class ProjectWorkspace {
     const incoming = `${this.dir}.incoming`;
     const backup = `${this.dir}.old`;
     await rm(incoming, { recursive: true, force: true });
-    await mkdir(incoming, { recursive: true });
+    await mkdir(incoming, { recursive: true, mode: 0o700 });
 
     let fileCount = 0;
-    const unsafe: string[] = [];
+    const skipped: string[] = [];
     try {
       for (const entry of zip.getEntries()) {
         if (entry.isDirectory) continue;
-        let target: string;
-        try {
-          target = safeJoin(incoming, entry.entryName);
-        } catch {
-          unsafe.push(entry.entryName);
+        // An archive is attacker-controlled input: an entry named `.git/config` would
+        // otherwise be written straight into the repository we are about to run git in.
+        const target = safeArchiveEntry(incoming, entry.entryName);
+        if (target === null) {
+          skipped.push(entry.entryName);
           continue;
         }
         await mkdir(dirname(target), { recursive: true });
         await writeFile(target, entry.getData());
         fileCount += 1;
       }
-      if (unsafe.length > 0) {
-        log.warn(`skipped ${unsafe.length} zip entr(ies) that escaped the project root`, unsafe.slice(0, 5));
+      if (skipped.length > 0) {
+        log.warn(`skipped ${skipped.length} archive entr(ies) outside the project`, skipped.slice(0, 5));
       }
       await swapIn(this.dir, incoming, backup);
     } finally {
       await rm(incoming, { recursive: true, force: true });
-      await rm(backup, { recursive: true, force: true });
     }
 
-    const sha = await commitAll(this.dir, `pull ${this.projectName} (${fileCount} files)`);
-    let head = sha ?? (await headSha(this.dir));
+    const sha = await commitAll(this.repo, `pull ${this.projectName} (${fileCount} files)`);
+    let head = sha ?? (await headSha(this.repo));
     if (!head) {
       // An empty project still needs a baseline commit, otherwise "has this mirror been
       // populated?" is unanswerable and every tool call would re-download the project.
-      await git(this.dir, ['commit', '-q', '--allow-empty', '-m', `pull ${this.projectName} (empty project)`]);
-      head = await headSha(this.dir);
+      await git(this.repo, ['commit', '-q', '--allow-empty', '-m', `pull ${this.projectName} (empty project)`]);
+      head = await headSha(this.repo);
     }
-    if (head) await markPushed(this.dir, head);
+    if (head) await markPushed(this.repo, head);
     return { fileCount };
-  }
-
-  /** True once the mirror reflects a real Overleaf state (i.e. a pull has completed). */
-  async isInitialized(): Promise<boolean> {
-    if (!existsSync(join(this.dir, '.git'))) return false;
-    return (await headSha(this.dir)) !== null;
   }
 
   // ── reading ──────────────────────────────────────────────────────────────
@@ -210,8 +225,8 @@ export class ProjectWorkspace {
     // would upload identical bytes back — harmless, but it would make `pending_changes`
     // and `edit_history` lie about what actually happened.
     await this.commit(`refresh ${normalizeRelPath(relPath)} from Overleaf`);
-    const head = await headSha(this.dir);
-    if (head) await markPushed(this.dir, head);
+    const head = await headSha(this.repo);
+    if (head) await markPushed(this.repo, head);
 
     log.debug(`refreshed ${relPath} from Overleaf (${remote.length} bytes)`);
     return true;
@@ -291,8 +306,33 @@ export class ProjectWorkspace {
       );
     }
     const path = safeJoin(this.dir, normalized);
+    await assertNotSymlink(path);
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, content, 'utf8');
+  }
+
+  /**
+   * Move a file or directory within the project.
+   *
+   * This is a filesystem move rather than read-then-write, so renaming a figure or a PDF
+   * works as well as renaming a `.tex` file.
+   */
+  async movePath(from: string, to: string): Promise<void> {
+    const source = safeJoin(this.dir, from);
+    const target = safeJoin(this.dir, to);
+    if (source === target) return;
+    if (!existsSync(source)) {
+      throw new ToolError(`cannot rename ${from}: no such file`);
+    }
+    if (existsSync(target)) {
+      throw new ToolError(
+        `cannot rename ${from} to ${to}: something already exists at that path`,
+        'Delete the existing file first, or choose another name.',
+      );
+    }
+    await assertNotSymlink(target);
+    await mkdir(dirname(target), { recursive: true });
+    await moveEntry(source, target);
   }
 
   async remove(relPath: string): Promise<void> {
@@ -304,7 +344,7 @@ export class ProjectWorkspace {
   }
 
   async commit(message: string): Promise<string | null> {
-    return commitAll(this.dir, message);
+    return commitAll(this.repo, message);
   }
 
   // ── diffing against Overleaf ─────────────────────────────────────────────
@@ -322,17 +362,18 @@ export class ProjectWorkspace {
    *    yet-pushed and edits that are not committed at all both appear in one list.
    *
    * Staging is a side effect, but a harmless one: it never discards content, and every
-   * push path commits what it staged.
+   * push path commits what it staged. It does mean this is not a pure read, which is why
+   * callers that must not mutate run it under the same lock as the operation it guards.
    */
   async changes(): Promise<PendingChange[]> {
-    if (!existsSync(join(this.dir, '.git'))) return [];
-    await git(this.dir, ['add', '-A'], true);
+    if (!existsSync(this.gitDir)) return [];
+    await git(this.repo, ['add', '-A'], true);
 
-    const watermark = await pushedSha(this.dir);
+    const watermark = await pushedSha(this.repo);
     const args = ['diff', '--cached', '--name-status', '-z', '--no-renames'];
     if (watermark) args.push(watermark);
 
-    const result = await git(this.dir, args, true);
+    const result = await git(this.repo, args, true);
     if (result.code !== 0) {
       // Failing open here would be dangerous rather than merely untidy: an empty change list
       // reads as "the mirror matches Overleaf", so a broken watermark would make push() a
@@ -361,15 +402,19 @@ export class ProjectWorkspace {
   /**
    * Send every pending change to Overleaf.
    *
-   * Uploads happen before deletes so a rename never leaves the project without the
-   * file at all, and the watermark only advances if every operation succeeded — a
-   * partial push stays pending and can simply be retried.
+   * Uploads and deletes are separate phases, and a failure in the first one cancels the
+   * second. That ordering is not cosmetic: a rename is an upload plus a delete, so letting
+   * the delete proceed after a failed upload leaves the project with neither the new file
+   * nor the old one — silent data loss, from an operation the user read as a rename.
+   *
+   * The watermark only advances when everything succeeded, so a partial push stays pending
+   * and can simply be retried.
    */
   async push(client: OverleafClient): Promise<PushOutcome> {
     await this.ensure();
     const changes = await this.changes();
     if (changes.length === 0) {
-      return { uploaded: [], deleted: [], failed: [], clean: true };
+      return { uploaded: [], deleted: [], failed: [], clean: true, deletionsDeferred: false };
     }
 
     // Safety valve. Emptying a project is essentially never what anyone intended, and it is
@@ -400,8 +445,12 @@ export class ProjectWorkspace {
       }
     }
 
-    for (const change of changes) {
-      if (change.status !== 'deleted') continue;
+    if (failed.length > 0) {
+      log.warn(`holding back ${removals.length} deletion(s) because ${failed.length} upload(s) failed`);
+      return { uploaded, deleted: [], failed, clean: false, deletionsDeferred: removals.length > 0 };
+    }
+
+    for (const change of removals) {
       try {
         await client.deleteByPath(this.projectId, change.path);
         deleted.push(change.path);
@@ -414,20 +463,20 @@ export class ProjectWorkspace {
     client.invalidateFolderTree(this.projectId);
 
     if (failed.length === 0) {
-      const sha = await commitAll(this.dir, `push to Overleaf (${uploaded.length} up, ${deleted.length} down)`);
-      const head = sha ?? (await headSha(this.dir));
-      if (head) await markPushed(this.dir, head);
+      const sha = await commitAll(this.repo, `push to Overleaf (${uploaded.length} up, ${deleted.length} down)`);
+      const head = sha ?? (await headSha(this.repo));
+      if (head) await markPushed(this.repo, head);
     }
 
-    return { uploaded, deleted, failed, clean: false };
+    return { uploaded, deleted, failed, clean: false, deletionsDeferred: false };
   }
 
   // ── history & undo ───────────────────────────────────────────────────────
 
   async history(limit: number): Promise<Array<{ sha: string; date: string; message: string }>> {
-    if (!existsSync(join(this.dir, '.git'))) return [];
+    if (!existsSync(this.gitDir)) return [];
     const result = await git(
-      this.dir,
+      this.repo,
       ['log', `-n${Math.max(1, Math.min(limit, 200))}`, '--pretty=format:%H%x09%aI%x09%s'],
       true,
     );
@@ -455,7 +504,7 @@ export class ProjectWorkspace {
    */
   async undo(steps: number): Promise<{ reverted: string[] }> {
     const count = Math.max(1, steps);
-    const log = await git(this.dir, ['log', '-n200', '--pretty=format:%H%x09%s'], true);
+    const log = await git(this.repo, ['log', '-n200', '--pretty=format:%H%x09%s'], true);
     if (log.code !== 0) {
       throw new ToolError('could not read the edit history from the local mirror');
     }
@@ -487,15 +536,15 @@ export class ProjectWorkspace {
       );
     }
 
-    const revert = await git(this.dir, ['revert', '--no-commit', ...targets], true);
+    const revert = await git(this.repo, ['revert', '--no-commit', ...targets], true);
     if (revert.code !== 0) {
-      await git(this.dir, ['revert', '--abort'], true);
+      await git(this.repo, ['revert', '--abort'], true);
       throw new ToolError(
         `could not undo automatically: ${revert.stderr.trim() || 'the edits conflict'}`,
         'Read the affected files and adjust them directly instead.',
       );
     }
-    const sha = await commitAll(this.dir, `undo ${targets.length} edit(s)`);
+    const sha = await commitAll(this.repo, `undo ${targets.length} edit(s)`);
     return { reverted: targets.map((s) => s.slice(0, 8)).concat(sha ? [sha.slice(0, 8)] : []) };
   }
 }
@@ -510,40 +559,49 @@ function sanitizeSegment(value: string): string {
 }
 
 /**
- * Replace the mirror's tracked content with a freshly extracted tree.
+ * Replace the work tree's contents with a freshly extracted tree.
  *
  * Existing entries are moved aside with renames (cheap, and reversible) before the new ones
- * are moved in, and everything is put back if any step fails. The alternative — deleting
- * the old tree first — creates a window where the mirror is incomplete, and an incomplete
- * mirror is indistinguishable from "the user deleted these files", which is exactly what
- * the next push would then do to their project.
+ * are moved in. The rollback is the delicate part: it removes only what was *installed* from
+ * `incoming` and restores whatever the backup actually holds. An earlier version deleted
+ * every remaining entry in the work tree, which destroyed exactly the files it was supposed
+ * to protect — the ones that had not been backed up yet when the failure happened.
  */
 async function swapIn(dir: string, incoming: string, backup: string): Promise<void> {
   await rm(backup, { recursive: true, force: true });
-  await mkdir(backup, { recursive: true });
+  await mkdir(backup, { recursive: true, mode: 0o700 });
 
-  const movedAside: string[] = [];
+  const installed: string[] = [];
+  let succeeded = false;
+
   try {
     for (const entry of readdirSync(dir)) {
-      if (entry === '.git') continue;
       await moveEntry(join(dir, entry), join(backup, entry));
-      movedAside.push(entry);
     }
     for (const entry of readdirSync(incoming)) {
       await moveEntry(join(incoming, entry), join(dir, entry));
+      installed.push(entry);
     }
+    succeeded = true;
   } catch (error) {
-    for (const entry of readdirSync(dir)) {
-      if (entry === '.git') continue;
+    for (const entry of installed) {
       await rm(join(dir, entry), { recursive: true, force: true }).catch(() => undefined);
     }
-    for (const entry of movedAside) {
+    // Restore from the directory listing rather than a record we may not have finished
+    // writing when the failure happened.
+    for (const entry of readdirSync(backup)) {
+      await rm(join(dir, entry), { recursive: true, force: true }).catch(() => undefined);
       await moveEntry(join(backup, entry), join(dir, entry)).catch(() => undefined);
     }
     throw new ToolError(
       `could not replace the local mirror: ${errorMessage(error)}`,
-      'The previous mirror contents were restored, so nothing was lost.',
+      `The previous contents were restored where possible, and a copy is kept at ${backup}.`,
     );
+  } finally {
+    await rm(incoming, { recursive: true, force: true });
+    // The backup is only redundant once the swap actually completed; otherwise it is the
+    // recovery copy and must survive.
+    if (succeeded) await rm(backup, { recursive: true, force: true });
   }
 }
 

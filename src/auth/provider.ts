@@ -16,6 +16,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 
 import { AUTH_CODE_TTL_MS, ACCESS_TOKEN_TTL_MS, REFRESH_TOKEN_TTL_MS } from './store.js';
 import type { AuthCode, OAuthClient, OAuthStore, TokenRecord } from './store.js';
+import { log } from '../util/logger.js';
 
 export const SCOPE_READ = 'overleaf.read';
 export const SCOPE_WRITE = 'overleaf.write';
@@ -299,15 +300,27 @@ export class OAuthProvider {
       throw new OAuthError('invalid_grant', 'refresh token is unknown or has expired');
     }
 
+    // A refresh token that has already been redeemed means the credential leaked: either the
+    // legitimate client or a thief is replaying it. Both hold tokens from the same grant, so
+    // the grant is revoked and the user re-authorizes. That revocation is the entire point of
+    // rotation — without it, "the old token no longer works" would be all that was achieved,
+    // while a stolen successor kept full access.
+    if (peek.status === 'used') {
+      const revoked = await this.options.store.revokeFamily(peek.family);
+      log.warn(`replayed refresh token detected; revoked ${revoked} token(s) in its grant`);
+      throw new OAuthError(
+        'invalid_grant',
+        'refresh token was already used; the grant has been revoked, please authorize again',
+      );
+    }
+
     // Then consume atomically: whoever claims it first is the only one who gets new tokens.
     const record = await this.options.store.claimToken(refreshToken);
     if (!record) {
-      throw new OAuthError('invalid_grant', 'refresh token was already used');
+      throw new OAuthError('invalid_grant', 'refresh token is unknown or has expired');
     }
 
-    // A replayed token means the credential leaked; drop the whole chain it belongs to.
-    await this.options.store.revokeFamily(refreshToken);
-    return this.mintTokens(clientId, record.scope, record.resource, refreshToken);
+    return this.mintTokens(clientId, record.scope, record.resource, record.family);
   }
 
   private authenticateClient(client: OAuthClient, secret: string | undefined): void {
@@ -321,10 +334,11 @@ export class OAuthProvider {
     clientId: string,
     scope: string | undefined,
     resource: string | undefined,
-    /** The refresh token this one replaces, so a chain can be revoked as a unit. */
-    parentRefreshToken?: string,
+    /** The grant this rotation belongs to; a fresh one is created when absent. */
+    family?: string,
   ): Promise<Record<string, unknown>> {
     const now = Date.now();
+    const grant = family ?? randomBytes(16).toString('hex');
     const accessToken = randomBytes(32).toString('base64url');
     const refreshToken = randomBytes(32).toString('base64url');
     const grantedScope = scope && scope.trim() !== '' ? scope : SUPPORTED_SCOPES.join(' ');
@@ -337,6 +351,8 @@ export class OAuthProvider {
       resource,
       expires_at: now + ACCESS_TOKEN_TTL_MS,
       created_at: now,
+      family: grant,
+      status: 'active',
     };
     const refresh: TokenRecord = {
       token: refreshToken,
@@ -346,8 +362,8 @@ export class OAuthProvider {
       resource,
       expires_at: now + REFRESH_TOKEN_TTL_MS,
       created_at: now,
-      // Points at the predecessor *refresh* token, which is what `revokeFamily` walks.
-      parent: parentRefreshToken,
+      family: grant,
+      status: 'active',
     };
     await this.options.store.putToken(access);
     await this.options.store.putToken(refresh);

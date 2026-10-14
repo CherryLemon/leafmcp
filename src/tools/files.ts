@@ -6,8 +6,24 @@ import { ToolError } from '../util/errors.js';
 import { normalizeRelPath } from '../util/paths.js';
 import { summarizeLatex, renderSummary } from '../overleaf/latex.js';
 import { looksBinary } from '../overleaf/workspace.js';
-import { formatBytesShort, formatChanges, publishIfConfigured, readyWorkspace, refreshBeforeUse } from './shared.js';
+import { searchIsolated } from './search.js';
+import {
+  formatBytesShort,
+  formatChanges,
+  optionalProject,
+  publishIfConfigured,
+  readyWorkspace,
+  refreshBeforeUse,
+  requireProjectArg,
+  requiredProject,
+} from './shared.js';
 import { assertWritable, defineTool } from './types.js';
+
+/** Upper bound on an isolated search. Far longer than any legitimate one, far shorter than forever. */
+const SEARCH_TIMEOUT_MS = 15_000;
+
+/** Only this much of a line is ever handed to a model-supplied pattern. */
+const MAX_LINE_SCAN = 4_000;
 
 /** Read a slice of a file's lines, 1-based and inclusive, clamped to the file. */
 export function sliceLines(
@@ -52,7 +68,7 @@ export const fileTools = [
     description: 'List files in the current project with sizes. Optionally filter by substring.',
     annotations: { readOnlyHint: true, openWorldHint: true },
     inputSchema: {
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: optionalProject,
       filter: z.string().optional().describe('Only show paths containing this substring.'),
     },
     async run(ctx, args) {
@@ -81,7 +97,7 @@ export const fileTools = [
     annotations: { readOnlyHint: true, openWorldHint: true },
     inputSchema: {
       path: z.string().describe('Project-relative path, e.g. "main.tex" or "sections/intro.tex".'),
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: optionalProject,
       start_line: z.number().int().positive().optional().describe('First line to return (1-based).'),
       end_line: z.number().int().positive().optional().describe('Last line to return (inclusive).'),
     },
@@ -104,7 +120,7 @@ export const fileTools = [
     annotations: { readOnlyHint: true, openWorldHint: true },
     inputSchema: {
       paths: z.array(z.string()).min(1).max(20).describe('Project-relative paths to read.'),
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: optionalProject,
     },
     async run(ctx, args) {
       const { workspace } = await readyWorkspace(ctx, args.project);
@@ -138,72 +154,46 @@ export const fileTools = [
       case_sensitive: z.boolean().optional().describe('Default false.'),
       glob: z.string().optional().describe('Only search paths containing this substring, e.g. ".tex" or "sections/".'),
       max_results: z.number().int().positive().max(300).optional().describe('Default 60.'),
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: optionalProject,
     },
     async run(ctx, args) {
       const { workspace } = await readyWorkspace(ctx, args.project);
       const limit = args.max_results ?? 60;
-      const flags = args.case_sensitive ? '' : 'i';
-
-      // A model-supplied regex runs on the one event loop this server has, so a pattern
-      // that backtracks catastrophically would hang every client, not just this call.
-      if (args.regex && looksCatastrophic(args.query)) {
-        throw new ToolError(
-          `the pattern ${JSON.stringify(args.query)} nests one repetition inside another, which can hang the server`,
-          'Rephrase it without a quantified group inside another quantifier, or search for a literal string instead.',
-        );
-      }
-
-      let matcher: RegExp;
-      try {
-        matcher = new RegExp(args.regex ? args.query : escapeRegExp(args.query), flags);
-      } catch (error) {
-        throw new ToolError(
-          `invalid regular expression: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
 
       let files = workspace.listFiles();
       if (args.glob) files = files.filter((f) => f.includes(args.glob as string));
+      const skip = files.filter(looksBinary);
 
-      const hits: string[] = [];
-      let scanned = 0;
-      let timedOut = false;
-      const deadline = Date.now() + SEARCH_BUDGET_MS;
+      // Runs in a child process so a pathological pattern can be killed rather than
+      // blocking the event loop every other request shares.
+      const outcome = await searchIsolated({
+        root: workspace.dir,
+        files,
+        skip,
+        pattern: args.query,
+        isRegex: args.regex ?? false,
+        caseSensitive: args.case_sensitive ?? false,
+        maxResults: limit,
+        lineCap: MAX_LINE_SCAN,
+        timeoutMs: SEARCH_TIMEOUT_MS,
+      });
 
-      for (const file of files) {
-        if (hits.length >= limit) break;
-        if (Date.now() > deadline) {
-          timedOut = true;
-          break;
-        }
-        if (looksBinary(file)) continue;
-        let content: string;
-        try {
-          content = await workspace.read(file);
-        } catch {
-          continue;
-        }
-        scanned += 1;
-        const lines = content.split('\n');
-        for (let i = 0; i < lines.length; i += 1) {
-          const raw = lines[i] ?? '';
-          // Only part of a very long line is ever matched, which bounds the work a single
-          // pattern can do against it.
-          if (matcher.test(raw.slice(0, MAX_LINE_SCAN))) {
-            hits.push(`${file}:${i + 1}: ${raw.trim().slice(0, 300)}`);
-            if (hits.length >= limit) break;
-          }
-        }
+      if (outcome.error) {
+        throw new ToolError(
+          `the search could not be completed: ${outcome.error}`,
+          'If the pattern was a regular expression, try a simpler one or search for a literal string.',
+        );
       }
 
-      const note = timedOut
-        ? `\n\n(stopped after ${SEARCH_BUDGET_MS / 1000}s to keep the server responsive; narrow the search with glob or max_results)`
+      const note = outcome.timedOut
+        ? `\n\n(stopped after ${SEARCH_TIMEOUT_MS / 1000}s: the pattern was too expensive to evaluate. ` +
+          'Narrow it with glob or max_results, or search for a literal string instead.)'
         : '';
-      if (hits.length === 0) {
+      if (outcome.hits.length === 0) {
         return `No matches for ${JSON.stringify(args.query)} in ${files.length} file(s).${note}`;
       }
-      return `${hits.length} match(es) in ${scanned} file(s) scanned:\n${hits.join('\n')}${note}`;
+      const rows = outcome.hits.map((hit) => `${hit.path}:${hit.line}: ${hit.text}`);
+      return `${outcome.hits.length} match(es) in ${outcome.scanned} file(s) scanned:\n${rows.join('\n')}${note}`;
     },
   }),
 
@@ -219,11 +209,11 @@ export const fileTools = [
       old_text: z.string().min(1).describe('Exact existing text to replace, copied from read_file output.'),
       new_text: z.string().describe('Replacement text. Use "" to delete the matched text.'),
       replace_all: z.boolean().optional().describe('Replace every occurrence instead of requiring a unique match.'),
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: requiredProject,
     },
     async run(ctx, args) {
       assertWritable(ctx, `editing ${args.path}`);
-      const { workspace } = await readyWorkspace(ctx, args.project);
+      const { project, workspace } = await requireProjectArg(ctx, args.project, 'edit_file');
       // Refresh before matching: if the user changed this text in the browser since the
       // model last read it, old_text stops matching and the edit fails loudly, instead of
       // silently overwriting their change.
@@ -245,16 +235,20 @@ export const fileTools = [
         );
       }
 
+      // Replacement text is inserted literally. `String.prototype.replace` interprets `$$`,
+      // `$&`, `$1` … in the replacement string, which silently corrupted exactly the LaTeX
+      // this tool exists to edit: writing `$$E = mc^2$$` produced `$E = mc^2$`, destroying
+      // display math. A function replacer disables that, and both branches now agree.
       const after = args.replace_all
         ? before.split(args.old_text).join(args.new_text)
-        : before.replace(args.old_text, args.new_text);
+        : before.replace(args.old_text, () => args.new_text);
 
       await workspace.write(args.path, after);
       const summary = describeEdit(before, after, args.replace_all ? occurrences : 1);
       const publish = await publishIfConfigured(ctx, workspace, {
         message: `edit ${normalizeRelPath(args.path)}`,
       });
-      return `Edited ${normalizeRelPath(args.path)}: ${summary}.${publish}`;
+      return `Edited ${normalizeRelPath(args.path)} in "${project.name}" (${project.id}): ${summary}.${publish}`;
     },
   }),
 
@@ -268,11 +262,11 @@ export const fileTools = [
     inputSchema: {
       path: z.string().describe('Project-relative path, e.g. "sections/methods.tex".'),
       content: z.string().describe('Full new contents of the file.'),
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: requiredProject,
     },
     async run(ctx, args) {
       assertWritable(ctx, `writing ${args.path}`);
-      const { workspace } = await readyWorkspace(ctx, args.project);
+      const { project, workspace } = await requireProjectArg(ctx, args.project, 'write_file');
       const existed = (await workspace.stat(args.path)) !== null;
 
       await workspace.write(args.path, args.content);
@@ -280,31 +274,33 @@ export const fileTools = [
       const publish = await publishIfConfigured(ctx, workspace, {
         message: `${existed ? 'overwrite' : 'create'} ${normalizeRelPath(args.path)}`,
       });
-      return `${existed ? 'Overwrote' : 'Created'} ${normalizeRelPath(args.path)} (${lines} lines, ${formatBytesShort(Buffer.byteLength(args.content, 'utf8'))}).${publish}`;
+      return `${existed ? 'Overwrote' : 'Created'} ${normalizeRelPath(args.path)} in "${project.name}" (${project.id}) — ${lines} lines, ${formatBytesShort(Buffer.byteLength(args.content, 'utf8'))}.${publish}`;
     },
   }),
 
   defineTool({
     name: 'delete_file',
     title: 'Delete a file',
-    description: 'Delete a file from the project. Requires confirm=true because it removes content from Overleaf.',
+    description:
+      'Delete a file from the project. Requires confirm=true because it removes content from Overleaf. ' +
+      'Note that confirm is a parameter you fill in, not an independent human approval — ask the user before deleting.',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     inputSchema: {
       path: z.string().describe('Project-relative path of the file to delete.'),
       confirm: z.boolean().describe('Must be true. Confirms you intend to delete this file.'),
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: requiredProject,
     },
     async run(ctx, args) {
       assertWritable(ctx, `deleting ${args.path}`);
       if (args.confirm !== true) {
         throw new ToolError('delete_file requires confirm=true', 'Ask the user before deleting files.');
       }
-      const { workspace } = await readyWorkspace(ctx, args.project);
+      const { project, workspace } = await requireProjectArg(ctx, args.project, 'delete_file');
       await workspace.remove(args.path);
       const publish = await publishIfConfigured(ctx, workspace, {
         message: `delete ${normalizeRelPath(args.path)}`,
       });
-      return `Deleted ${normalizeRelPath(args.path)}.${publish}`;
+      return `Deleted ${normalizeRelPath(args.path)} from "${project.name}" (${project.id}).${publish}`;
     },
   }),
 
@@ -316,18 +312,18 @@ export const fileTools = [
     inputSchema: {
       from: z.string().describe('Current project-relative path.'),
       to: z.string().describe('New project-relative path.'),
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: requiredProject,
     },
     async run(ctx, args) {
       assertWritable(ctx, `renaming ${args.from}`);
-      const { workspace } = await readyWorkspace(ctx, args.project);
-      const content = await workspace.read(args.from);
-      await workspace.write(args.to, content);
-      await workspace.remove(args.from);
+      const { project, workspace } = await requireProjectArg(ctx, args.project, 'rename_file');
+      // A filesystem move, so it works for figures and PDFs as well as .tex sources, and it
+      // refuses to overwrite an existing destination rather than silently replacing it.
+      await workspace.movePath(args.from, args.to);
       const publish = await publishIfConfigured(ctx, workspace, {
         message: `rename ${normalizeRelPath(args.from)} -> ${normalizeRelPath(args.to)}`,
       });
-      return `Moved ${normalizeRelPath(args.from)} to ${normalizeRelPath(args.to)}.${publish}`;
+      return `Moved ${normalizeRelPath(args.from)} to ${normalizeRelPath(args.to)} in "${project.name}" (${project.id}).${publish}`;
     },
   }),
 
@@ -340,7 +336,7 @@ export const fileTools = [
     annotations: { readOnlyHint: true, openWorldHint: true },
     inputSchema: {
       path: z.string().describe('Project-relative path of a .tex file.'),
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: optionalProject,
     },
     async run(ctx, args) {
       const { workspace } = await readyWorkspace(ctx, args.project);
@@ -356,7 +352,7 @@ export const fileTools = [
     description: 'List local edits that have not been sent to Overleaf yet.',
     annotations: { readOnlyHint: true, openWorldHint: true },
     inputSchema: {
-      project: z.string().optional().describe('Project id or name; defaults to the selected project.'),
+      project: optionalProject,
     },
     async run(ctx, args) {
       const { workspace } = await readyWorkspace(ctx, args.project);
@@ -364,29 +360,6 @@ export const fileTools = [
     },
   }),
 ];
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/** Upper bound on how long a single search may occupy the event loop. */
-const SEARCH_BUDGET_MS = 5_000;
-
-/** Only this much of a line is ever handed to a model-supplied pattern. */
-const MAX_LINE_SCAN = 4_000;
-
-/**
- * Detect the classic catastrophic-backtracking shape: a group that itself contains a
- * repetition, wrapped in another repetition — `(a+)+`, `(\d+)*`, `([a-z]+\.)+`.
- *
- * This is a heuristic, not a proof, which is why the search also carries a deadline and a
- * per-line cap. It is deliberately narrow so ordinary patterns are not rejected: groups
- * containing alternation without an inner quantifier, which are the more ambiguous case,
- * are allowed through and bounded by the deadline instead.
- */
-function looksCatastrophic(pattern: string): boolean {
-  return /\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*[+*]/.test(pattern);
-}
 
 function countOccurrences(haystack: string, needle: string): number {
   if (needle === '') return 0;
