@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { ToolError } from '../util/errors.js';
 import { parseLatexLog, renderLogSummary } from '../overleaf/latexlog.js';
 import {
+  ensureReady,
   formatChanges,
   readyWorkspace,
   requireProjectArg,
@@ -52,9 +53,18 @@ export const buildTools = [
       project: requiredProject,
       resource_path: z.string().optional().describe('Main .tex path for multi-document projects.'),
     },
+    managesOwnLock: true,
     async run(ctx, args) {
-      const { project, workspace } = await requireProjectArg(ctx, args.project, 'compile');
-      const note = await ensurePublished(ctx, workspace);
+      const project = await ctx.registry.resolve(args.project);
+      const workspace = ctx.workspaces.for(project);
+
+      // Publishing is a workspace mutation, so it is serialised. The compilation itself is
+      // not: it runs on Overleaf's servers for up to a minute, and holding the project lock
+      // across it would block every other client of the same project for no benefit.
+      const note = await ctx.locks.run(project.id, async () => {
+        await ensureReady(ctx, workspace);
+        return ensurePublished(ctx, workspace);
+      });
 
       const result = await ctx.session.run((client) =>
         client.compileProject(project.id, args.resource_path),
@@ -115,7 +125,13 @@ export const buildTools = [
     },
     async run(ctx, args) {
       assertWritable(ctx, 'reloading the project');
-      const { project, workspace } = await requireProjectArg(ctx, args.project, 'pull_project');
+
+      // Deliberately not `readyWorkspace`: that helper initialises by pulling without force,
+      // so a forced reload could be refused by the very step it is meant to bypass.
+      const project = await ctx.registry.resolve(args.project);
+      const workspace = ctx.workspaces.for(project);
+      await workspace.ensure();
+
       const { fileCount } = await ctx.session.run((client) =>
         workspace.pull(client, { force: args.force ?? false }),
       );

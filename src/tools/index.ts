@@ -93,11 +93,23 @@ export async function runWithProjectLock(
   spec: AnyToolSpec,
   args: Record<string, unknown>,
 ): Promise<ToolReturn> {
-  if (spec.annotations.readOnlyHint === true) {
+  // Any tool that can name a project can also touch its workspace: reading triggers
+  // initialisation, a pull and a refresh, and `changes()` walks the files. Leaving reads
+  // outside the lock let a refresh race an edit and advance sync state on its behalf.
+  const touchesWorkspace = 'project' in spec.inputSchema;
+  if (!touchesWorkspace || spec.managesOwnLock === true) {
     return spec.run(ctx, args as never);
   }
+
   const projectRef = typeof args.project === 'string' ? args.project : undefined;
-  const project = await ctx.registry.resolve(projectRef);
+  let project;
+  try {
+    project = await ctx.registry.resolve(projectRef);
+  } catch {
+    // No usable project yet. Let the tool itself report that, rather than replacing a helpful
+    // message with a lock-acquisition failure.
+    return spec.run(ctx, args as never);
+  }
   return ctx.locks.run(project.id, () => spec.run(ctx, args as never));
 }
 

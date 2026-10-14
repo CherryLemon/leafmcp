@@ -54,6 +54,14 @@ export interface ToolSpec<S extends z.ZodRawShape = z.ZodRawShape> {
   description: string;
   annotations: ToolAnnotations;
   inputSchema: S;
+  /**
+   * Set when the tool manages its own critical section.
+   *
+   * Only `compile` does: publishing must be serialised, but the remote compilation that
+   * follows takes up to a minute and holding the project lock for it would stall every other
+   * client for no benefit.
+   */
+  managesOwnLock?: boolean;
   run: (ctx: ToolContext, args: z.infer<z.ZodObject<S>>) => Promise<ToolReturn>;
 }
 

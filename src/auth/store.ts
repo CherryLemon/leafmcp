@@ -66,9 +66,19 @@ interface StoreShape {
   clients: Record<string, OAuthClient>;
   codes: Record<string, AuthCode>;
   tokens: Record<string, TokenRecord>;
+  /**
+   * Grants that have been revoked, keyed by family and stamped with when.
+   *
+   * Deleting the tokens of a grant is not the same as revoking it. A refresh request that
+   * already read its record can still be in flight when the revocation happens, and it would
+   * then write fresh, valid tokens for a grant that was supposed to be dead. A recorded
+   * status is what makes revocation durable: minting consults it, so a late write is refused
+   * instead of resurrecting the grant.
+   */
+  revoked: Record<string, number>;
 }
 
-const EMPTY: StoreShape = { clients: {}, codes: {}, tokens: {} };
+const EMPTY: StoreShape = { clients: {}, codes: {}, tokens: {}, revoked: {} };
 
 export const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000; // 1h
 export const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30d
@@ -90,6 +100,7 @@ export class OAuthStore {
           clients: parsed.clients ?? {},
           codes: parsed.codes ?? {},
           tokens: parsed.tokens ?? {},
+          revoked: parsed.revoked ?? {},
         };
       }
     } catch (error) {
@@ -132,6 +143,11 @@ export class OAuthStore {
     for (const [token, record] of Object.entries(this.data.tokens)) {
       if (record.expires_at <= now) delete this.data.tokens[token];
     }
+    // A revocation only needs remembering for as long as a token from that grant could still
+    // be presented, which is the refresh lifetime.
+    for (const [family, revokedAt] of Object.entries(this.data.revoked)) {
+      if (now - revokedAt > REFRESH_TOKEN_TTL_MS) delete this.data.revoked[family];
+    }
   }
 
   async putClient(client: OAuthClient): Promise<void> {
@@ -171,6 +187,11 @@ export class OAuthStore {
     await this.load();
     this.data.tokens[record.token] = record;
     await this.persist();
+  }
+
+  /** Synchronous on purpose: callers use it inside a critical section. */
+  isGrantRevoked(family: string): boolean {
+    return this.data.revoked[family] !== undefined;
   }
 
   async getToken(token: string): Promise<TokenRecord | undefined> {
@@ -228,6 +249,11 @@ export class OAuthStore {
    */
   async revokeFamily(family: string): Promise<number> {
     await this.load();
+
+    // Marking and deleting happen in one synchronous block, with no await between them. That
+    // is what makes the outcome independent of interleaving: a concurrent mint either
+    // completes first and has its records deleted here, or observes the mark and refuses.
+    this.data.revoked[family] = Date.now();
     let removed = 0;
     for (const [token, record] of Object.entries(this.data.tokens)) {
       if (record.family === family) {
@@ -235,7 +261,23 @@ export class OAuthStore {
         removed += 1;
       }
     }
-    if (removed > 0) await this.persist();
+
+    await this.persist();
     return removed;
+  }
+
+  /**
+   * Insert freshly minted tokens, unless the grant has been revoked.
+   *
+   * The check and the insertion share a synchronous block for the reason above: an in-flight
+   * refresh must not be able to write tokens for a grant that was revoked while it was
+   * waiting. Returns false when the grant is dead, and the caller turns that into an error.
+   */
+  async mintTokens(records: TokenRecord[], family: string): Promise<boolean> {
+    await this.load();
+    if (this.data.revoked[family] !== undefined) return false;
+    for (const record of records) this.data.tokens[record.token] = record;
+    await this.persist();
+    return true;
   }
 }

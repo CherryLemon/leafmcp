@@ -35,11 +35,12 @@ import {
 import { ToolError, errorMessage } from '../util/errors.js';
 import {
   commitAll,
+  commitPaths,
   createRepo,
   git,
+  gitBlob,
+  hardenRepo,
   headSha,
-  markPushed,
-  pushedSha,
   type GitRepo,
 } from '../util/git.js';
 import { log } from '../util/logger.js';
@@ -72,6 +73,27 @@ export interface PendingChange {
   path: string;
   status: ChangeStatus;
 }
+
+/**
+ * What Overleaf was last known to hold, per file.
+ *
+ * Change detection used to be a single `refs/overleaf/pushed` commit, which is wrong whenever
+ * a file can become up to date on its own: refreshing `b.tex` from the browser while `a.tex`
+ * still had unpublished edits advanced that one ref past both, and `a.tex` then looked
+ * already-published and was never uploaded. A per-file record has no such failure mode —
+ * updating one entry cannot speak for another file.
+ *
+ * It also removes git from the trust path. Deriving "what needs publishing" from the index
+ * meant a failed `git add` produced a confident "nothing to publish"; here the answer comes
+ * from hashing the files themselves.
+ */
+interface SyncManifest {
+  version: 1;
+  /** Project-relative path -> sha256 of the content Overleaf is believed to hold. */
+  remote: Record<string, string>;
+}
+
+const EMPTY_MANIFEST: SyncManifest = { version: 1, remote: {} };
 
 export interface PushOutcome {
   uploaded: string[];
@@ -115,6 +137,8 @@ export class ProjectWorkspace {
   readonly dir: string;
   /** Git metadata, deliberately a sibling rather than a child of the work tree. */
   readonly gitDir: string;
+  /** Per-file record of what Overleaf holds; see `SyncManifest`. */
+  private readonly manifestPath: string;
 
   constructor(
     private readonly root: string,
@@ -125,6 +149,7 @@ export class ProjectWorkspace {
     const segment = sanitizeSegment(projectId);
     this.dir = join(root, 'projects', segment);
     this.gitDir = join(root, 'meta', `${segment}.git`);
+    this.manifestPath = join(root, 'meta', `${segment}.sync.json`);
   }
 
   private get repo(): GitRepo {
@@ -137,15 +162,143 @@ export class ProjectWorkspace {
     // 0700: these directories hold someone's unpublished papers.
     await mkdir(this.dir, { recursive: true, mode: 0o700 });
     await mkdir(dirname(this.gitDir), { recursive: true, mode: 0o700 });
+
+    if (!existsSync(this.gitDir) && existsSync(join(this.dir, '.git'))) {
+      await this.migrateLegacyLayout();
+      return;
+    }
     if (!existsSync(this.gitDir)) {
       await createRepo(this.gitDir, this.dir);
     }
   }
 
+  /**
+   * Move a pre-existing in-tree `.git` to the separated layout.
+   *
+   * Two things make this more than a directory move.
+   *
+   * The old configuration is untrusted. It lived inside the tree the assistant could write
+   * to, and git configuration can name programs to run (`core.fsmonitor`, `core.hooksPath`,
+   * `filter.*.clean`), so it is replaced wholesale rather than read — nothing from it is
+   * allowed to reach a git invocation. Objects and refs are data, so they are carried over,
+   * and that is what preserves history.
+   *
+   * The sync state is reconstructed rather than guessed. The old watermark ref says which
+   * commit Overleaf held, so files that differ from it are still unpublished and their
+   * manifest entry must be the *watermark's* content — otherwise a pending edit would be
+   * recorded as already published and never sent. If the ref is missing, nothing is assumed
+   * published: the files are re-uploaded, which is idempotent and cannot lose anything.
+   */
+  private async migrateLegacyLayout(): Promise<void> {
+    const legacyDir = join(this.dir, '.git');
+    log.warn(`migrating ${this.projectId} to the separated git layout`);
+
+    // Read the watermark as a plain file, before any git command touches the moved directory.
+    const legacyWatermark = await readFile(join(legacyDir, 'refs', 'overleaf', 'pushed'), 'utf8')
+      .then((value) => value.trim())
+      .catch(() => null);
+
+    await moveEntry(legacyDir, this.gitDir);
+
+    // A known-good configuration, written rather than parsed.
+    await writeFile(
+      join(this.gitDir, 'config'),
+      '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n',
+      'utf8',
+    );
+    // Per-worktree config is an extension that could reintroduce settings we just replaced.
+    await rm(join(this.gitDir, 'config.worktree'), { force: true });
+    await rm(join(this.gitDir, 'hooks'), { recursive: true, force: true });
+
+    const repo: GitRepo = { gitDir: this.gitDir, workDir: this.dir };
+    await hardenRepo(repo);
+
+    const manifest: SyncManifest = { version: 1, remote: {} };
+    if (legacyWatermark) {
+      const tracked = (await git(repo, ['ls-tree', '-r', '--name-only', legacyWatermark], true)).stdout
+        .split('\n')
+        .filter(Boolean);
+      // Untracked files must be included explicitly: `git diff` cannot see them, so a file
+      // created locally but never committed would be recorded as already published — the
+      // same blind spot that once kept new files out of a push, in a new place.
+      const untracked = (await git(repo, ['ls-files', '--others', '--exclude-standard'], true)).stdout
+        .split('\n')
+        .filter(Boolean);
+      const changed = new Set([
+        ...(await git(repo, ['diff', '--name-only', legacyWatermark], true)).stdout.split('\n').filter(Boolean),
+        ...untracked,
+      ]);
+
+      for (const path of this.listFiles()) {
+        if (!changed.has(path)) {
+          // Untouched since the last push, so local content is what Overleaf holds.
+          await this.recordCurrentHash(manifest, path);
+          continue;
+        }
+        const blob = await gitBlob(repo, `${legacyWatermark}:${path}`);
+        // No blob means the file is new since the watermark, so it is genuinely unpublished.
+        if (blob) manifest.remote[path] = createHash('sha256').update(blob).digest('hex');
+      }
+
+      // Files deleted locally must stay in the manifest, or the deletion would be invisible.
+      for (const path of tracked) {
+        if (manifest.remote[path] !== undefined) continue;
+        const blob = await gitBlob(repo, `${legacyWatermark}:${path}`);
+        if (blob) manifest.remote[path] = createHash('sha256').update(blob).digest('hex');
+      }
+    } else {
+      log.warn(`no sync watermark found for ${this.projectId}; treating every file as unpublished`);
+    }
+
+    await this.saveManifest(manifest);
+    log.warn(
+      `migrated ${this.projectId}: ${Object.keys(manifest.remote).length} file(s) recorded as published`,
+    );
+  }
+
+  private async recordCurrentHash(manifest: SyncManifest, relative: string): Promise<void> {
+    try {
+      const content = await readFile(safeJoin(this.dir, relative));
+      manifest.remote[relative] = createHash('sha256').update(content).digest('hex');
+    } catch {
+      // Unreadable now; leaving it out means it re-uploads rather than being assumed synced.
+    }
+  }
+
   /** True once the mirror reflects a real Overleaf state (i.e. a pull has completed). */
   async isInitialized(): Promise<boolean> {
-    if (!existsSync(this.gitDir)) return false;
-    return (await headSha(this.repo)) !== null;
+    return existsSync(this.manifestPath);
+  }
+
+  private async loadManifest(): Promise<SyncManifest> {
+    try {
+      const parsed = JSON.parse(await readFile(this.manifestPath, 'utf8')) as Partial<SyncManifest>;
+      return { version: 1, remote: parsed.remote ?? {} };
+    } catch {
+      return { ...EMPTY_MANIFEST, remote: {} };
+    }
+  }
+
+  private async saveManifest(manifest: SyncManifest): Promise<void> {
+    await mkdir(dirname(this.manifestPath), { recursive: true, mode: 0o700 });
+    const tmp = `${this.manifestPath}.tmp`;
+    await writeFile(tmp, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    await rename(tmp, this.manifestPath);
+  }
+
+  /** Hash every project file, so the stored values mean something about content. */
+  private async hashProjectFiles(): Promise<Map<string, string>> {
+    const hashes = new Map<string, string>();
+    for (const relative of this.listFiles()) {
+      try {
+        const content = await readFile(safeJoin(this.dir, relative));
+        hashes.set(relative, createHash('sha256').update(content).digest('hex'));
+      } catch {
+        // A file we cannot read is not a file we can claim is in sync, so it is left out and
+        // will surface as "deleted" until it is readable again.
+      }
+    }
+    return hashes;
   }
 
   /**
@@ -155,6 +308,20 @@ export class ProjectWorkspace {
    */
   async pull(client: OverleafClient, options: { force?: boolean } = {}): Promise<{ fileCount: number }> {
     await this.ensure();
+
+    // Local files with no sync record means the metadata was lost or an upgrade was
+    // interrupted. Overwriting is almost certainly not what anyone wants, and the old guard
+    // below cannot catch it because with no manifest there is nothing to compare against.
+    if (!options.force && !(await this.isInitialized())) {
+      const present = this.listFiles();
+      if (present.length > 0) {
+        throw new ToolError(
+          `refusing to pull: ${present.length} file(s) exist locally but this mirror has no record of what Overleaf holds`,
+          'This happens after an interrupted upgrade or if the sync state was removed. Pass ' +
+            'force=true to replace the local files with the copy from Overleaf.',
+        );
+      }
+    }
 
     const pending = await this.changes();
     if (pending.length > 0 && !options.force) {
@@ -233,14 +400,16 @@ export class ProjectWorkspace {
     }
 
     const sha = await commitAll(this.repo, `pull ${this.projectName} (${fileCount} files)`);
-    let head = sha ?? (await headSha(this.repo));
-    if (!head) {
-      // An empty project still needs a baseline commit, otherwise "has this mirror been
-      // populated?" is unanswerable and every tool call would re-download the project.
+    if (!sha && !(await headSha(this.repo))) {
+      // An empty project still needs a first commit: without HEAD there is no history for
+      // `undo` and `edit_history` to refer to.
       await git(this.repo, ['commit', '-q', '--allow-empty', '-m', `pull ${this.projectName} (empty project)`]);
-      head = await headSha(this.repo);
     }
-    if (head) await markPushed(this.repo, head);
+
+    // Written last, and it is what marks the mirror ready. A crash before this point leaves
+    // the project to be pulled again rather than a half-populated mirror that reports itself
+    // as initialised.
+    await this.saveManifest({ version: 1, remote: Object.fromEntries(await this.hashProjectFiles()) });
     return { fileCount };
   }
 
@@ -262,10 +431,16 @@ export class ProjectWorkspace {
    * Returns true only when the mirror actually changed.
    */
   async refreshFileFromRemote(client: OverleafClient, relPath: string): Promise<boolean> {
-    const pending = await this.changes();
-    if (pending.length > 0) return false;
+    const normalized = normalizeRelPath(relPath);
 
-    const path = safeJoin(this.dir, relPath);
+    // Scoped to this file, not the whole project. Refusing to refresh anything while any
+    // other file is unpublished was the safe answer under the old shared baseline, and it
+    // cost freshness exactly when a batch of edits was in progress. With per-file state,
+    // refreshing `b.tex` cannot disturb `a.tex`.
+    const pending = await this.changes();
+    if (pending.some((change) => change.path === normalized)) return false;
+
+    const path = safeJoin(this.dir, normalized);
     let remote: Buffer;
     try {
       remote = await client.downloadByPath(this.projectId, normalizeRelPath(relPath));
@@ -280,15 +455,19 @@ export class ProjectWorkspace {
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, remote);
 
-    // The refreshed content *is* what Overleaf holds, so the baseline moves with it.
-    // Without this the file would look like an unpublished local change and the next push
-    // would upload identical bytes back — harmless, but it would make `pending_changes`
-    // and `edit_history` lie about what actually happened.
-    await this.commit(`refresh ${normalizeRelPath(relPath)} from Overleaf`);
-    const head = await headSha(this.repo);
-    if (head) await markPushed(this.repo, head);
+    // Exactly one entry moves. This is the fix for the worst consequence of the old shared
+    // watermark: refreshing one file used to advance a project-wide marker past *every*
+    // commit, so another file's unpublished edit silently became "already published" and was
+    // never uploaded.
+    const manifest = await this.loadManifest();
+    manifest.remote[normalized] = createHash('sha256').update(remote).digest('hex');
+    await this.saveManifest(manifest);
 
-    log.debug(`refreshed ${relPath} from Overleaf (${remote.length} bytes)`);
+    // Committed for history only, and only this path, so the log does not take credit for
+    // edits made elsewhere.
+    await commitPaths(this.repo, [normalized], `refresh ${normalized} from Overleaf`);
+
+    log.debug(`refreshed ${normalized} from Overleaf (${remote.length} bytes)`);
     return true;
   }
 
@@ -410,51 +589,31 @@ export class ProjectWorkspace {
   // ── diffing against Overleaf ─────────────────────────────────────────────
 
   /**
-   * Changes between the last successful push and the working tree.
+   * Files whose content differs from what Overleaf is known to hold.
    *
-   * Two subtleties, both load-bearing:
-   *
-   *  - `git add -A` runs first. Plain `git diff <commit>` compares against the *working
-   *    tree*, which by definition cannot see untracked files — so a file the model just
-   *    created would silently never be pushed. Staging first and comparing the index
-   *    makes new files show up as `A`.
-   *  - The watermark commit is the comparison base, so edits that are committed-but-not-
-   *    yet-pushed and edits that are not committed at all both appear in one list.
-   *
-   * Staging is a side effect, but a harmless one: it never discards content, and every
-   * push path commits what it staged. It does mean this is not a pure read, which is why
-   * callers that must not mutate run it under the same lock as the operation it guards.
+   * Computed by hashing the project files against the per-file manifest, so this is a pure
+   * read: it stages nothing, takes no lock, and cannot fail open. The previous implementation
+   * asked git, which meant an `add` that failed (a full disk, an unreadable file) could leave
+   * the index untouched and produce a confident empty list — the server would then report
+   * "already synced" about changes it had never sent.
    */
   async changes(): Promise<PendingChange[]> {
-    if (!existsSync(this.gitDir)) return [];
-    await git(this.repo, ['add', '-A'], true);
+    if (!existsSync(this.manifestPath)) return [];
 
-    const watermark = await pushedSha(this.repo);
-    const args = ['diff', '--cached', '--name-status', '-z', '--no-renames'];
-    if (watermark) args.push(watermark);
-
-    const result = await git(this.repo, args, true);
-    if (result.code !== 0) {
-      // Failing open here would be dangerous rather than merely untidy: an empty change list
-      // reads as "the mirror matches Overleaf", so a broken watermark would make push() a
-      // silent no-op and would disable pull()'s guard against discarding unpublished edits.
-      throw new ToolError(
-        `could not determine which files differ from Overleaf: ${result.stderr.trim() || 'git diff failed'}`,
-        'The local mirror repository looks damaged. Remove that project directory under the ' +
-          'data directory and run pull_project to rebuild it from Overleaf.',
-      );
-    }
-
-    const tokens = result.stdout.split('\0').filter((t) => t !== '');
+    const manifest = await this.loadManifest();
+    const current = await this.hashProjectFiles();
     const changes: PendingChange[] = [];
-    for (let i = 0; i + 1 < tokens.length; i += 2) {
-      const code = tokens[i]?.[0];
-      const path = tokens[i + 1];
-      if (!code || !path) continue;
-      const status: ChangeStatus = code === 'A' ? 'added' : code === 'D' ? 'deleted' : 'modified';
-      changes.push({ path, status });
+
+    for (const [path, hash] of current) {
+      const known = manifest.remote[path];
+      if (known === undefined) changes.push({ path, status: 'added' });
+      else if (known !== hash) changes.push({ path, status: 'modified' });
     }
-    return changes;
+    for (const path of Object.keys(manifest.remote)) {
+      if (!current.has(path)) changes.push({ path, status: 'deleted' });
+    }
+
+    return changes.sort((a, b) => a.path.localeCompare(b.path));
   }
 
   // ── pushing ──────────────────────────────────────────────────────────────
@@ -523,9 +682,17 @@ export class ProjectWorkspace {
     client.invalidateFolderTree(this.projectId);
 
     if (failed.length === 0) {
-      const sha = await commitAll(this.repo, `push to Overleaf (${uploaded.length} up, ${deleted.length} down)`);
-      const head = sha ?? (await headSha(this.repo));
-      if (head) await markPushed(this.repo, head);
+      // Record only the files that actually landed, and hash them from disk so the recorded
+      // value describes what was sent rather than what we intended to send.
+      const manifest = await this.loadManifest();
+      const current = await this.hashProjectFiles();
+      for (const path of uploaded) {
+        const hash = current.get(path);
+        if (hash !== undefined) manifest.remote[path] = hash;
+      }
+      for (const path of deleted) delete manifest.remote[path];
+      await this.saveManifest(manifest);
+      await commitAll(this.repo, `push to Overleaf (${uploaded.length} up, ${deleted.length} down)`);
     }
 
     return { uploaded, deleted, failed, clean: false, deletionsDeferred: false };

@@ -363,6 +363,12 @@ export class OAuthProvider {
       throw new OAuthError('invalid_grant', 'refresh token is unknown or has expired');
     }
 
+    // Checked again at mint time rather than only here: between claiming the token and
+    // writing its successors there is an await, and a revocation can land inside it.
+    if (this.options.store.isGrantRevoked(record.family)) {
+      throw new OAuthError('invalid_grant', 'this authorization has been revoked; please authorize again');
+    }
+
     return this.mintTokens(clientId, record.scope, record.resource, record.family);
   }
 
@@ -408,8 +414,13 @@ export class OAuthProvider {
       family: grant,
       status: 'active',
     };
-    await this.options.store.putToken(access);
-    await this.options.store.putToken(refresh);
+    // Inserted through the store so the revocation check and the write are one atomic step;
+    // a refresh that was already in flight when its grant was revoked must not be able to
+    // write itself back to life.
+    const inserted = await this.options.store.mintTokens([access, refresh], grant);
+    if (!inserted) {
+      throw new OAuthError('invalid_grant', 'this authorization has been revoked; please authorize again');
+    }
 
     return {
       access_token: accessToken,

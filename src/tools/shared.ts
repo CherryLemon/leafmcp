@@ -33,18 +33,21 @@ export async function readyWorkspace(
 ): Promise<{ project: ActiveProject; workspace: ProjectWorkspace }> {
   const project = await ctx.registry.resolve(projectRef);
   const workspace = ctx.workspaces.for(project);
-  await workspace.ensure();
-
-  if (!(await workspace.isInitialized())) {
-    const { fileCount } = await ctx.session.run((client) => workspace.pull(client));
-    return { project, workspace };
-  }
-
-  // A project named in the call but never opened should still work without a manual pull.
-  if ((await workspace.listFiles()).length === 0) {
-    await ctx.session.run((client) => workspace.pull(client));
-  }
+  await ensureReady(ctx, workspace);
   return { project, workspace };
+}
+
+/**
+ * Bring a workspace to a usable state: created, and populated from Overleaf if it never was.
+ *
+ * The previous version also re-pulled whenever the file list came back empty, which meant a
+ * genuinely empty project — or one whose every file is filtered out — re-downloaded on every
+ * single tool call. `pull_project` is the explicit way to ask for a reload.
+ */
+export async function ensureReady(ctx: ToolContext, workspace: ProjectWorkspace): Promise<void> {
+  await workspace.ensure();
+  if (await workspace.isInitialized()) return;
+  await ctx.session.run((client) => workspace.pull(client));
 }
 
 /**

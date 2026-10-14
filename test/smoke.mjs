@@ -15,7 +15,7 @@
 import { createServer } from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
 import { strict as assert } from 'node:assert';
-import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -1212,6 +1212,201 @@ try {
   });
   check('an over-deep entry is skipped, not extracted', deepResult.fileCount === 1, String(deepResult.fileCount));
   check('the shallow entry still arrived', ws10.listFiles().join(',') === 'shallow.tex', ws10.listFiles().join(','));
+
+  // ── regression R1: refreshing one file must not speak for another ─────────
+  section('Regression R1 — a refresh cannot mark another file as published');
+
+  // The failure this guards against: a.tex holds an unpublished edit, a read request
+  // refreshes b.tex, and the project-wide watermark advances past both — so a.tex looks
+  // already published and is never uploaded.
+  let syncZip = new AdmZip();
+  syncZip.addFile('a.tex', Buffer.from('A-remote-v1\n'));
+  syncZip.addFile('b.tex', Buffer.from('B-remote-v1\n'));
+  const syncClient = {
+    downloadProject: async () => syncZip.toBuffer(),
+    downloadByPath: async (_projectId, path) => {
+      if (path === 'b.tex') return Buffer.from('B-remote-v2\n');
+      return Buffer.from('A-remote-v1\n');
+    },
+    uploadFile: async () => ({ success: true }),
+    deleteByPath: async () => undefined,
+    invalidateFolderTree: () => undefined,
+  };
+
+  const wsR1 = new ProjectWorkspace(dataDir, 'r1probe', 'R1 Probe', { maxFileBytes: 1024 * 1024 });
+  await wsR1.pull(syncClient);
+  check('the project starts clean', (await wsR1.changes()).length === 0);
+
+  await wsR1.write('a.tex', 'A-local-unpublished\n');
+  check('a.tex is pending', (await wsR1.changes()).some((c) => c.path === 'a.tex' && c.status === 'modified'));
+
+  const refreshedB = await wsR1.refreshFileFromRemote(syncClient, 'b.tex');
+  check('b.tex was refreshed even while a.tex is pending', refreshedB === true);
+
+  const afterRefresh = await wsR1.changes();
+  check(
+    'a.tex is STILL pending after refreshing b.tex',
+    afterRefresh.some((c) => c.path === 'a.tex' && c.status === 'modified'),
+    JSON.stringify(afterRefresh),
+  );
+  check('b.tex is no longer pending', !afterRefresh.some((c) => c.path === 'b.tex'), JSON.stringify(afterRefresh));
+  check('the refreshed content is on disk', (await wsR1.read('b.tex')).includes('v2'));
+
+  // A file with its own unpublished edit must still refuse to be overwritten.
+  const selfGuardClient = {
+    ...syncClient,
+    downloadByPath: async () => Buffer.from('A-remote-OVERWRITE\n'),
+  };
+  check('a file with pending edits is not refreshed', (await wsR1.refreshFileFromRemote(selfGuardClient, 'a.tex')) === false);
+  check('its local edit survived', (await wsR1.read('a.tex')).includes('A-local-unpublished'), await wsR1.read('a.tex'));
+
+  // ── regression R2: change detection must not depend on git ────────────────
+  section('Regression R2 — change detection survives a broken git index');
+
+  // Previously `changes()` staged files and diffed the index, so a failed `git add` could
+  // leave a stale index and produce a confident "nothing to publish" about changes that were
+  // never sent. Hashing the files removes git from that decision entirely.
+  await wsR1.write('c.tex', 'C-new-file\n');
+  const beforeIndexDamage = await wsR1.changes();
+  check('the new file is detected', beforeIndexDamage.some((c) => c.path === 'c.tex'), JSON.stringify(beforeIndexDamage));
+
+  writeFileSync(join(wsR1.gitDir, 'index'), Buffer.from('GARBAGE-NOT-AN-INDEX'));
+  const afterIndexDamage = await wsR1.changes();
+  check(
+    'changes() still reports the truth with a corrupt index',
+    afterIndexDamage.some((c) => c.path === 'c.tex') && afterIndexDamage.some((c) => c.path === 'a.tex'),
+    JSON.stringify(afterIndexDamage),
+  );
+
+  // A commit genuinely needs git, and must fail loudly rather than silently succeed.
+  let commitFailed = false;
+  try {
+    await wsR1.commit('edit: should fail');
+  } catch {
+    commitFailed = true;
+  }
+  check('a commit with a corrupt index fails loudly', commitFailed);
+  rmSync(join(wsR1.gitDir, 'index'), { force: true });
+
+  // ── regression R3: revocation is a state, not a deletion ──────────────────
+  section('Regression R3 — a revoked grant cannot be resurrected');
+
+  const revokeStore = new OAuthStore(join(dataDir, 'revoke-probe.json'));
+  const revokeProvider = new OAuthProvider({
+    store: revokeStore,
+    issuer: config.auth.oauth.issuer,
+    resourceUrl: `${config.publicUrl}/mcp`,
+    password: PASS,
+    oauthEnabled: true,
+  });
+  await revokeStore.load();
+  await revokeStore.putToken({
+    token: 'fresh-access', kind: 'access', client_id: 'c1', family: 'grant-x',
+    expires_at: Date.now() + 60_000, created_at: Date.now(), status: 'active',
+  });
+  await revokeStore.revokeFamily('grant-x');
+  check('the grant is recorded as revoked', revokeStore.isGrantRevoked('grant-x') === true);
+
+  // This is the race: a request that read its record before the revocation still tries to
+  // write successors afterwards. Deleting the old rows would not have stopped it.
+  const resurrected = await revokeStore.mintTokens(
+    [
+      { token: 'late-access', kind: 'access', client_id: 'c1', family: 'grant-x', expires_at: Date.now() + 60_000, created_at: Date.now(), status: 'active' },
+      { token: 'late-refresh', kind: 'refresh', client_id: 'c1', family: 'grant-x', expires_at: Date.now() + 60_000, created_at: Date.now(), status: 'active' },
+    ],
+    'grant-x',
+  );
+  check('minting into a revoked grant is refused', resurrected === false);
+  check('no successor token exists', (await revokeStore.getToken('late-access')) === undefined);
+
+  let revokedRefused = false;
+  try {
+    await revokeProvider.refresh('nonexistent', 'c1');
+  } catch {
+    revokedRefused = true;
+  }
+  check('a refresh against a dead grant fails', revokedRefused);
+
+  // ── regression R4: the old in-tree git layout migrates safely ─────────────
+  section('Regression R4 — legacy mirrors migrate without losing state');
+
+  const { execFileSync } = await import('node:child_process');
+  const legacyRoot = join(dataDir, 'legacy');
+  const legacyWork = join(legacyRoot, 'projects', 'oldproj');
+  mkdirSync(legacyWork, { recursive: true });
+
+  // Build the pre-upgrade layout: a real repository *inside* the work tree, with a watermark
+  // and one unpublished edit.
+  const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+  delete gitEnv.GIT_DIR;
+  delete gitEnv.GIT_WORK_TREE;
+  const legacyGit = (...args) => execFileSync('git', args, { cwd: legacyWork, env: gitEnv, stdio: 'pipe' });
+
+  legacyGit('init', '-q', '-b', 'main');
+  legacyGit('config', 'user.email', 'legacy@test');
+  legacyGit('config', 'user.name', 'legacy');
+  writeFileSync(join(legacyWork, 'published.tex'), 'already on overleaf\n');
+  writeFileSync(join(legacyWork, 'edited.tex'), 'first version\n');
+  legacyGit('add', '-A');
+  legacyGit('commit', '-qm', 'pull');
+  legacyGit('update-ref', 'refs/overleaf/pushed', 'HEAD');
+
+  writeFileSync(join(legacyWork, 'edited.tex'), 'local edit not yet uploaded\n');
+  writeFileSync(join(legacyWork, 'brand-new.tex'), 'created locally\n');
+
+  // A configuration that would execute a program, to prove migration does not carry it over.
+  const legacyConfig = readFileSync(join(legacyWork, '.git', 'config'), 'utf8');
+  writeFileSync(
+    join(legacyWork, '.git', 'config'),
+    `${legacyConfig}[core]\n\tfsmonitor = /tmp/lm-legacy-PWNED\n`,
+  );
+
+  const wsR4 = new ProjectWorkspace(legacyRoot, 'oldproj', 'Old Project', { maxFileBytes: 1024 * 1024 });
+  await wsR4.ensure();
+
+  check('the git directory moved out of the work tree', !existsSync(join(legacyWork, '.git')));
+  check('the git directory now lives beside it', existsSync(wsR4.gitDir) && wsR4.gitDir.startsWith(join(legacyRoot, 'meta')));
+
+  const migrated = await wsR4.changes();
+  const migratedByPath = Object.fromEntries(migrated.map((c) => [c.path, c.status]));
+  check(
+    'the unpublished edit is still pending after migration',
+    migratedByPath['edited.tex'] === 'modified',
+    JSON.stringify(migratedByPath),
+  );
+  check(
+    'the already-published file is NOT reported as pending',
+    migratedByPath['published.tex'] === undefined,
+    JSON.stringify(migratedByPath),
+  );
+  check('a locally created file is reported as new', migratedByPath['brand-new.tex'] === 'added', JSON.stringify(migratedByPath));
+  check('the local edit survived migration', (await wsR4.read('edited.tex')).includes('not yet uploaded'));
+  check('history survived migration', (await wsR4.history(5)).length >= 1);
+  check('the planted fsmonitor command never ran', !existsSync('/tmp/lm-legacy-PWNED'));
+
+  const migratedConfig = readFileSync(join(wsR4.gitDir, 'config'), 'utf8');
+  check('the legacy fsmonitor setting was discarded', !migratedConfig.includes('lm-legacy-PWNED'), migratedConfig.slice(0, 200));
+  check('hardening was reapplied', /hooksPath/.test(migratedConfig) && /fsmonitor = false/.test(migratedConfig));
+
+  // ── regression: a mirror with local files but no sync record refuses to pull ──
+  const orphanRoot = join(dataDir, 'orphan');
+  const orphanWork = join(orphanRoot, 'projects', 'orphanproj');
+  mkdirSync(orphanWork, { recursive: true });
+  writeFileSync(join(orphanWork, 'work.tex'), 'hours of unsaved work\n');
+  const wsOrphan = new ProjectWorkspace(orphanRoot, 'orphanproj', 'Orphan', { maxFileBytes: 1024 * 1024 });
+  let orphanRefused = false;
+  try {
+    await wsOrphan.pull({
+      downloadProject: async () => new AdmZip().toBuffer(),
+      uploadFile: async () => ({ success: true }),
+      deleteByPath: async () => undefined,
+      invalidateFolderTree: () => undefined,
+    });
+  } catch (error) {
+    orphanRefused = /no record of what Overleaf holds/.test(String(error.message));
+  }
+  check('a pull over unexplained local files is refused', orphanRefused);
+  check('the unexplained files are untouched', existsSync(join(orphanWork, 'work.tex')));
 
   // ── regression: the token store is not world-readable ──────────────────────
   section('Regression — OAuth state file permissions');

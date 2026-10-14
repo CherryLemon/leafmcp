@@ -318,9 +318,12 @@ those hints to decide when to ask for confirmation.
 
 ### Design notes
 
-- **Mirror plus git.** Each project has a locally cached, git-versioned mirror. The ref
-  `refs/overleaf/pushed` records what Overleaf already has, so "what would a push change?" is a
-  `git diff` rather than bookkeeping we could get wrong.
+- **Mirror plus per-file sync state.** Each project has a locally cached, git-versioned mirror.
+  What Overleaf holds is recorded per file, as a content hash, rather than as one project-wide
+  ref: a single ref cannot describe a state where one file was refreshed while another still has
+  unpublished edits, and the version that tried made the pending file look published. Hashing
+  also keeps git out of the decision, so a failed `git add` can no longer produce a confident
+  "nothing to publish".
 - **One writer per project.** Every mutating tool runs under that project's lock, so the whole refresh → read → write → commit → publish sequence is atomic with respect to other clients. Without it, two edits arriving together both read the same base and the second discards the first. Different projects stay fully concurrent. This serialises within one process; two server instances must not share a data directory.
 - **A partial publish is an error, not a footnote.** If any file fails to reach Overleaf, the tool result is flagged as an error, because a warning inside an otherwise successful response is easy for a model to summarise away as "done" — and the user then believes their paper was updated.
 - **Edits can be pinned to a version.** `read_file` reports a `sha256:` prefix and `edit_file` accepts it as `expected_hash`, so an edit written against text that has since changed is refused rather than applied. Overleaf offers no atomic conditional write, so this cannot close the race between the check and the upload — but it turns the common case, "the user edited this after the model read it", into a conflict someone has to look at.
@@ -405,6 +408,11 @@ is **fixed and covered by a regression test** (`npm test`, the `Regression` sect
 | Medium | Project import had no limits. `pull` holds the whole archive in memory, so a project with a hundred thousand entries, one enormous entry, or a deeply nested path was enough to exhaust the process. | Entry count, per-entry and total extracted size, and path depth are all bounded; the declared size is checked before decompressing and the real size after, since a crafted archive can understate it. |
 | Medium | The consent screen could be framed and cached. It is the one page where a click decides whether a stranger gets write access to someone's papers. | CSP with `frame-ancestors 'none'` and `form-action 'self'`, plus `X-Frame-Options: DENY`, `Cache-Control: no-store`, a referrer policy and `nosniff`. There is no script on the page at all. |
 | Low | The Docker build used `npm install` while CI used `npm ci`, so an image could contain dependency versions no lockfile ever pinned. | Both stages use `npm ci`. |
+| **High** | Sync state was a single project-wide commit ref, so refreshing one file from Overleaf advanced the baseline past *every* file — another file's unpublished edit then looked already published and was never uploaded. Reproduced: an unpublished `a.tex` disappeared from `pending_changes` when `b.tex` was refreshed. | Sync state is now a per-file manifest of content hashes. Updating one entry cannot speak for another file, and the regression test asserts the pending file survives. |
+| **High** | Change detection asked git, which fails open: `git add`'s exit code was ignored, so a failed staging (a full disk, an unreadable file) could leave the index untouched and `git diff --cached` then reported no changes — the server would announce "already synced" about edits it had never sent, and the same empty list disabled the guard protecting unpublished work. | Detection hashes the files directly. Git is no longer in the trust path for deciding what to publish. |
+| **High** | Read-only tools were outside the project lock, yet reading initialises the mirror, pulls it and refreshes files — all mutations. A read could race an edit and advance sync state on its behalf. | Every tool that can name a project now takes that project's lock. `compile` scopes its own critical section so a minute-long remote build does not block other clients. |
+| **Medium** | Revocation deleted token rows but recorded no status, so a refresh already in flight when the grant was revoked could still write fresh, valid successors. Deleting records is a snapshot, not a state. | Grants have a durable revoked marker; minting consults it inside the same synchronous block as the insert, so a late write is refused rather than resurrecting the grant. |
+| **Medium** | Upgrading from the old in-tree `.git` layout had no migration: the mirror looked uninitialised, so the next pull replaced the work tree — discarding unpublished edits — and the old configuration, which had lived inside the assistant-writable tree, would have been trusted. | Migration moves the git directory out, **replaces** the old config rather than reading it, clears hooks, and rebuilds the manifest from the old watermark so unpublished files stay unpublished. A work tree with files but no sync record now refuses to be pulled over. |
 | Low | `use_project` had no read-only check and writes global state, so a read-only connection could retarget another client's edits. | Read-only check added. |
 | Low | `MCP_AUTH_MODE=none` granted anonymous write access. | Read-only by default; requires `OLMCP_ALLOW_ANONYMOUS_WRITE=true` to opt in. |
 | Low | Static tokens were compared in non-constant time; redaction missed custom cookie names; successful tool output bypassed redaction. | Constant-time comparison, runtime-registered secrets, output redacted too. |
@@ -476,7 +484,7 @@ src/
     search.ts             Spawns and supervises the isolated search
     search-worker.ts      Runs the pattern somewhere it can be killed
   transport/http.ts     Express app: MCP endpoint, OAuth, health check
-test/smoke.mjs          End-to-end suite (179 checks)
+test/smoke.mjs          End-to-end suite (206 checks)
 docker/                 Dockerfile, compose, Caddyfile
 ```
 

@@ -87,6 +87,46 @@ export function gitEnv(repo: GitRepo): NodeJS.ProcessEnv {
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const GIT_TIMEOUT_MS = 120_000;
 
+/**
+ * Read a blob out of a repository without decoding it.
+ *
+ * Used by the migration path, which has to hash the *previous* content of files that have
+ * since been edited locally — and those may be images or PDFs, where a utf8 round trip would
+ * silently change the bytes and produce a hash that matches nothing.
+ */
+export function gitBlob(repo: GitRepo, spec: string): Promise<Buffer | null> {
+  return new Promise((resolvePromise) => {
+    const child = spawn('git', ['cat-file', 'blob', spec], {
+      cwd: repo.workDir,
+      env: gitEnv(repo),
+      windowsHide: true,
+    });
+    const chunks: Buffer[] = [];
+    child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+    child.on('error', () => resolvePromise(null));
+    child.on('close', (code) => resolvePromise(code === 0 ? Buffer.concat(chunks) : null));
+  });
+}
+
+/** Apply the configuration that keeps a repository from executing anything. */
+export async function hardenRepo(repo: GitRepo): Promise<void> {
+  await git(repo, ['config', 'core.bare', 'false'], true);
+  await git(repo, ['config', 'core.worktree', repo.workDir], true);
+  await git(repo, ['config', 'user.name', 'leafmcp'], true);
+  await git(repo, ['config', 'user.email', 'leafmcp@localhost'], true);
+  await git(repo, ['config', 'commit.gpgsign', 'false'], true);
+  await git(repo, ['config', 'core.autocrlf', 'false'], true);
+  // Point hooks at an empty directory rather than disabling them by name, so a hook cannot be
+  // reintroduced by creating a file somewhere we forgot about.
+  await git(repo, ['config', 'core.hooksPath', join(repo.gitDir, 'no-hooks')], true);
+  await git(repo, ['config', 'core.fsmonitor', 'false'], true);
+  await git(repo, ['config', 'core.pager', 'cat'], true);
+  await git(repo, ['config', 'core.editor', 'true'], true);
+  await git(repo, ['config', 'core.sshCommand', 'false'], true);
+  await git(repo, ['config', 'protocol.file.allow', 'never'], true);
+  await git(repo, ['config', 'protocol.ext.allow', 'never'], true);
+}
+
 export function git(repo: GitRepo, args: string[], allowFailure = false): Promise<GitResult> {
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn('git', args, {
@@ -196,29 +236,30 @@ export async function createRepo(gitDir: string, workDir: string): Promise<GitRe
   });
 
   // A bare repository has no work tree; these settings are what make it usable as one.
-  await git(repo, ['config', 'core.bare', 'false'], true);
-  await git(repo, ['config', 'core.worktree', workDir], true);
-  await git(repo, ['config', 'user.name', 'leafmcp'], true);
-  await git(repo, ['config', 'user.email', 'leafmcp@localhost'], true);
-  await git(repo, ['config', 'commit.gpgsign', 'false'], true);
-  await git(repo, ['config', 'core.autocrlf', 'false'], true);
-  // Second layer: even inside our own git directory, refuse to run hooks or a filesystem
-  // monitor. Point hooks at an empty directory rather than disabling them by name, so a
-  // hook cannot be reintroduced by creating a file somewhere we forgot about.
-  await git(repo, ['config', 'core.hooksPath', join(gitDir, 'no-hooks')], true);
-  await git(repo, ['config', 'core.fsmonitor', 'false'], true);
-  await git(repo, ['config', 'core.pager', 'cat'], true);
-  await git(repo, ['config', 'core.editor', 'true'], true);
-  await git(repo, ['config', 'core.sshCommand', 'false'], true);
-  await git(repo, ['config', 'protocol.file.allow', 'never'], true);
-  await git(repo, ['config', 'protocol.ext.allow', 'never'], true);
-
+  await hardenRepo(repo);
   return repo;
 }
 
 export async function gitOk(repo: GitRepo, args: string[]): Promise<boolean> {
   const result = await git(repo, args, true);
   return result.code === 0;
+}
+
+/**
+ * Commit only the given paths.
+ *
+ * Used where one file changes but others may hold unrelated unpublished edits: staging
+ * everything would fold another operation's work into this commit, and the message would
+ * then describe something the commit does not actually contain.
+ */
+export async function commitPaths(repo: GitRepo, paths: string[], message: string): Promise<string | null> {
+  if (paths.length === 0) return null;
+  await git(repo, ['add', '--', ...paths]);
+  const staged = await git(repo, ['diff', '--cached', '--name-only', '--', ...paths]);
+  if (!staged.stdout.trim()) return null;
+  await git(repo, ['commit', '-q', '-m', message, '--', ...paths]);
+  const rev = await git(repo, ['rev-parse', 'HEAD']);
+  return rev.stdout.trim();
 }
 
 /** Commit everything currently in the working tree, if anything changed. */
@@ -233,20 +274,5 @@ export async function commitAll(repo: GitRepo, message: string): Promise<string 
 
 export async function headSha(repo: GitRepo): Promise<string | null> {
   const result = await git(repo, ['rev-parse', 'HEAD'], true);
-  return result.code === 0 ? result.stdout.trim() : null;
-}
-
-/**
- * Point the `refs/overleaf/pushed` ref at a commit.
- *
- * That ref is the watermark of "what Overleaf already has". Everything after it is a
- * pending local change, which makes push a pure `git diff pushed..HEAD`.
- */
-export async function markPushed(repo: GitRepo, sha: string): Promise<void> {
-  await git(repo, ['update-ref', 'refs/overleaf/pushed', sha]);
-}
-
-export async function pushedSha(repo: GitRepo): Promise<string | null> {
-  const result = await git(repo, ['rev-parse', '--verify', '--quiet', 'refs/overleaf/pushed'], true);
   return result.code === 0 ? result.stdout.trim() : null;
 }
