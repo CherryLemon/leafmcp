@@ -25,12 +25,14 @@ export const ALL_TOOLS: AnyToolSpec[] = [
 
 export const SERVER_INSTRUCTIONS = [
   'This server reads and edits the user\'s Overleaf LaTeX projects.',
-  'Start with list_projects, then use_project to choose one; project_overview then shows the',
-  'file tree and the LaTeX section structure. Read before you write: read_file or',
-  'file_outline first, then edit_file with an exact old_text copied from what you read.',
-  'Edits are published to Overleaf immediately by default, so the user sees them in their',
-  'browser within seconds, and every edit is versioned — undo_last_edit reverses recent',
-  'changes and republishes. After substantive edits, call compile and fix reported errors.',
+  'Start with list_projects, then use_project to choose one; project_overview shows the file',
+  'tree and the LaTeX section structure. Read before you write: read_file or file_outline',
+  'first, then edit_file with an exact old_text copied from what you read.',
+  'For a change spanning several files, or one that should not be visible half-finished, call',
+  'begin_change_set first and commit_change_set when the whole change is ready;',
+  'abandon_change_set discards it. Single edits publish immediately otherwise.',
+  'Every mutating call reports an operation id, and undo_operation reverses one of them.',
+  'After substantive edits call compile and fix the errors it reports.',
   'Never claim a change was made unless the tool result confirms it.',
 ].join(' ');
 

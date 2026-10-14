@@ -1633,6 +1633,145 @@ try {
     !exactProvider.isRedirectAllowed('https://evil.example/?next=https://mcp.example.com/cb'),
   );
 
+  // ── regression: change sets make a multi-file edit atomic ─────────────────
+  section('Regression — a change set is published as one unit or not at all');
+
+  const toolByName = (list, name) => list.find((tool) => tool.name === name);
+  const beginSet = toolByName(buildTools, 'begin_change_set');
+  const commitSet = toolByName(buildTools, 'commit_change_set');
+  const abandonSet = toolByName(buildTools, 'abandon_change_set');
+  const undoOperation = toolByName(buildTools, 'undo_operation');
+
+  const csZip = new AdmZip();
+  csZip.addFile('intro.tex', Buffer.from('Introduction v1\n'));
+  csZip.addFile('methods.tex', Buffer.from('Methods v1\n'));
+  const csUploads = [];
+  const csClient = {
+    downloadProject: async () => csZip.toBuffer(),
+    uploadFile: async (_p, _f, name) => {
+      csUploads.push(name);
+      return { success: true };
+    },
+    deleteByPath: async () => undefined,
+    invalidateFolderTree: () => undefined,
+  };
+
+  const wsCS = new ProjectWorkspace(dataDir, 'csprobe', 'Change Set Probe', { maxFileBytes: 1024 * 1024 });
+  await wsCS.pull(csClient);
+  csUploads.length = 0;
+
+  const csCtx = {
+    config: { ...config, autoPush: true, readOnly: false, freshReads: false },
+    readOnly: false,
+    session: { run: (fn) => fn(csClient) },
+    registry: { resolve: async () => ({ id: 'csprobe', name: 'Change Set Probe' }) },
+    workspaces: { for: () => wsCS },
+    locks: new KeyedMutex(),
+  };
+
+  const beginResult = await beginSet.run(csCtx, { description: 'tighten the introduction', project: 'csprobe' });
+  const csId = /cs_[0-9a-f]+/.exec(beginResult)?.[0];
+  check('a change set opens with an id', typeof csId === 'string', beginResult);
+  check('it says nothing has been published yet', /Nothing reaches Overleaf/.test(beginResult));
+
+  let doubleOpenRefused = false;
+  try {
+    await beginSet.run(csCtx, { description: 'another', project: 'csprobe' });
+  } catch (error) {
+    doubleOpenRefused = /already open/.test(String(error.message));
+  }
+  check('a second change set cannot be opened at the same time', doubleOpenRefused);
+
+  const firstEdit = await editBoth.run(csCtx, {
+    path: 'intro.tex', old_text: 'Introduction v1', new_text: 'Introduction v2', project: 'csprobe',
+  });
+  await editBoth.run(csCtx, {
+    path: 'methods.tex', old_text: 'Methods v1', new_text: 'Methods v2', project: 'csprobe',
+  });
+
+  check('the first edit reports being staged', /Staged in change set/.test(firstEdit.text), firstEdit.text);
+  const firstOperationId = /op_[0-9a-f]+/.exec(firstEdit.text)?.[0];
+  check('the edit reports an operation id', typeof firstOperationId === 'string', firstEdit.text);
+  check('nothing was uploaded while the set is open', csUploads.length === 0, JSON.stringify(csUploads));
+  check('both edits are present locally', (await wsCS.read('intro.tex')).includes('v2') && (await wsCS.read('methods.tex')).includes('v2'));
+  check('both are reported as pending', (await wsCS.changes()).length === 2);
+
+  const committed = await commitSet.run(csCtx, { project: 'csprobe' });
+  check('the commit publishes every file at once', csUploads.includes('intro.tex') && csUploads.includes('methods.tex'), JSON.stringify(csUploads));
+  check('the commit reports the operation count', /2 operation\(s\) folded in/.test(committed), committed);
+  check('nothing is pending afterwards', (await wsCS.changes()).length === 0);
+  check('the change set is closed', (await wsCS.journal.getOpen()) === null);
+
+  // Undo one operation while leaving unrelated later work alone. The later edit touches a
+  // different file on purpose: reversing an edit whose own lines were rewritten afterwards is
+  // a conflict, and refusing that is the correct behaviour (tested next).
+  await editBoth.run(csCtx, { path: 'methods.tex', old_text: 'Methods v2', new_text: 'Methods v3', project: 'csprobe' });
+  check('the later edit landed', (await wsCS.read('methods.tex')).includes('Methods v3'));
+
+  const undone = await undoOperation.run(csCtx, { operation_id: firstOperationId, project: 'csprobe' });
+  check('undo_operation reports which operation it reversed', undone.text.includes(firstOperationId), undone.text);
+  check('the targeted operation was reversed', (await wsCS.read('intro.tex')).includes('Introduction v1'), await wsCS.read('intro.tex'));
+  check('the unrelated later edit was left alone', (await wsCS.read('methods.tex')).includes('Methods v3'), await wsCS.read('methods.tex'));
+
+  // Reversing an edit whose own lines were rewritten afterwards must refuse rather than guess.
+  const conflicting = await editBoth.run(csCtx, {
+    path: 'intro.tex', old_text: 'Introduction v1', new_text: 'Introduction CONFLICT-A', project: 'csprobe',
+  });
+  const conflictId = /op_[0-9a-f]+/.exec(conflicting.text)?.[0];
+  await editBoth.run(csCtx, {
+    path: 'intro.tex', old_text: 'Introduction CONFLICT-A', new_text: 'Introduction CONFLICT-B', project: 'csprobe',
+  });
+  let conflictRefused = false;
+  try {
+    await undoOperation.run(csCtx, { operation_id: conflictId, project: 'csprobe' });
+  } catch (error) {
+    conflictRefused = /conflicts with later edits/.test(String(error.message));
+  }
+  check('reversing an edit that later edits rewrote is refused', conflictRefused);
+  check('the refusal left the file as it was', (await wsCS.read('intro.tex')).includes('CONFLICT-B'), await wsCS.read('intro.tex'));
+
+  let unknownOperationRefused = false;
+  try {
+    await undoOperation.run(csCtx, { operation_id: 'op_doesnotexist', project: 'csprobe' });
+  } catch (error) {
+    unknownOperationRefused = /no operation/.test(String(error.message));
+  }
+  check('an unknown operation id is refused', unknownOperationRefused);
+
+  // Abandoning discards the work without ever touching Overleaf.
+  csUploads.length = 0;
+  await beginSet.run(csCtx, { description: 'a rewrite we will discard', project: 'csprobe' });
+  await editBoth.run(csCtx, { path: 'methods.tex', old_text: 'Methods v3', new_text: 'Methods DISCARDED', project: 'csprobe' });
+  check('the discarded edit is on disk first', (await wsCS.read('methods.tex')).includes('DISCARDED'));
+
+  const abandoned = await abandonSet.run(csCtx, { project: 'csprobe' });
+  check('abandoning lists what it reverted', /methods\.tex/.test(abandoned), abandoned);
+  check('the edit is gone', !(await wsCS.read('methods.tex')).includes('DISCARDED'), await wsCS.read('methods.tex'));
+  check('the file is back to its committed content', (await wsCS.read('methods.tex')).includes('Methods v3'));
+  check('abandoning never published anything', csUploads.length === 0, JSON.stringify(csUploads));
+  check('the change set is closed after abandoning', (await wsCS.journal.getOpen()) === null);
+
+  let nothingToAbandon = false;
+  try {
+    await abandonSet.run(csCtx, { project: 'csprobe' });
+  } catch (error) {
+    nothingToAbandon = /no open change set/.test(String(error.message));
+  }
+  check('abandoning with nothing open is refused', nothingToAbandon);
+
+  // A failed publish must leave the set open rather than losing it.
+  csUploads.length = 0;
+  await beginSet.run(csCtx, { description: 'will fail to publish', project: 'csprobe' });
+  await editBoth.run(csCtx, { path: 'intro.tex', old_text: 'Introduction CONFLICT-B', new_text: 'Introduction v4', project: 'csprobe' });
+  const failingCtx = {
+    ...csCtx,
+    session: { run: (fn) => fn({ ...csClient, uploadFile: async () => { throw new Error('upload refused'); } }) },
+  };
+  const failedCommit = await commitSet.run(failingCtx, { project: 'csprobe' });
+  check('a failed commit is an error result', failedCommit.isError === true, JSON.stringify(failedCommit));
+  check('the change set stays open after a failure', (await wsCS.journal.getOpen())?.id !== undefined);
+  check('the work is still there', (await wsCS.read('intro.tex')).includes('v4'));
+
   // ── regression: the token store is not world-readable ──────────────────────
   section('Regression — OAuth state file permissions');
 

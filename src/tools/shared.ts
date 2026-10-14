@@ -103,6 +103,10 @@ export async function refreshBeforeUse(
 export interface SaveOptions {
   /** Commit message recorded in the mirror's history. */
   message: string;
+  /** The tool making the change; recorded in the project journal with an operation id. */
+  tool: string;
+  /** Files this operation touched. */
+  paths: string[];
 }
 
 export interface PublishReport {
@@ -110,6 +114,8 @@ export interface PublishReport {
   note: string;
   /** False when something did not reach Overleaf, so the caller can mark the result failed. */
   ok: boolean;
+  /** The journal entry for this call, so a caller can report or later undo it. */
+  operationId: string;
 }
 
 /**
@@ -127,17 +133,42 @@ export async function publishIfConfigured(
   workspace: ProjectWorkspace,
   options: SaveOptions,
 ): Promise<PublishReport> {
-  await workspace.commit(`${EDIT_COMMIT_PREFIX} ${options.message}`);
+  const commit = await workspace.commit(`${EDIT_COMMIT_PREFIX} ${options.message}`);
+
+  // Every mutating call is recorded, whether or not it publishes, so it can be referred to
+  // afterwards by id instead of by "the third commit back".
+  const operation = await workspace.journal.record({
+    tool: options.tool,
+    commit,
+    paths: options.paths,
+  });
+  const tag = `\n\noperation ${operation.id}`;
+  const open = await workspace.journal.getOpen();
+
+  // An open change set suspends publishing. That is the whole point of opening one: the
+  // edits land together or not at all, rather than leaving a half-revised paper visible.
+  if (open) {
+    return {
+      note:
+        `\n\nStaged in change set ${open.id} ("${open.description}"). Nothing has reached Overleaf yet — ` +
+        `call commit_change_set once the whole change is ready, or abandon_change_set to discard it.${tag}`,
+      ok: true,
+      operationId: operation.id,
+    };
+  }
 
   if (!ctx.config.autoPush) {
     return {
-      note: '\n\nSaved to the local mirror. Changes are NOT yet on Overleaf — call publish_changes to send them.',
+      note: `\n\nSaved to the local mirror. Changes are NOT yet on Overleaf — call publish_changes to send them.${tag}`,
       ok: true,
+      operationId: operation.id,
     };
   }
 
   const outcome = await ctx.session.run((client) => workspace.push(client));
-  if (outcome.clean) return { note: '\n\nSynced with Overleaf (nothing to send).', ok: true };
+  if (outcome.clean) {
+    return { note: `\n\nSynced with Overleaf (nothing to send).${tag}`, ok: true, operationId: operation.id };
+  }
 
   const parts: string[] = [];
   const sent = outcome.uploaded.length + outcome.deleted.length;
@@ -156,7 +187,7 @@ export async function publishIfConfigured(
           : ''),
     );
   }
-  return { note: parts.join(''), ok: outcome.failed.length === 0 };
+  return { note: parts.join('') + tag, ok: outcome.failed.length === 0, operationId: operation.id };
 }
 
 /**

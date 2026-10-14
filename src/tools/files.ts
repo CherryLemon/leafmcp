@@ -277,6 +277,8 @@ export const fileTools = [
       const summary = describeEdit(before, after, args.replace_all ? occurrences : 1);
       const publish = await publishIfConfigured(ctx, workspace, {
         message: `edit ${normalizeRelPath(args.path)}`,
+          tool: 'edit_file',
+          paths: [normalizeRelPath(args.path)],
       });
       return withPublish(`Edited ${normalizeRelPath(args.path)} in "${project.name}" (${project.id}): ${summary}.${publish.note}`, publish);
     },
@@ -303,6 +305,8 @@ export const fileTools = [
       const lines = args.content.split('\n').length;
       const publish = await publishIfConfigured(ctx, workspace, {
         message: `${existed ? 'overwrite' : 'create'} ${normalizeRelPath(args.path)}`,
+          tool: 'write_file',
+          paths: [normalizeRelPath(args.path)],
       });
       return withPublish(`${existed ? 'Overwrote' : 'Created'} ${normalizeRelPath(args.path)} in "${project.name}" (${project.id}) — ${lines} lines, ${formatBytesShort(Buffer.byteLength(args.content, 'utf8'))}.${publish.note}`, publish);
     },
@@ -346,6 +350,8 @@ export const fileTools = [
       await workspace.remove(args.path, { recursive: args.recursive ?? false });
       const publish = await publishIfConfigured(ctx, workspace, {
         message: `delete ${normalizeRelPath(args.path)}`,
+          tool: 'delete_file',
+          paths: [normalizeRelPath(args.path)],
       });
       const what = target.isDirectory
         ? `${normalizeRelPath(args.path)} and its ${target.files.length} file(s)`
@@ -372,6 +378,8 @@ export const fileTools = [
       await workspace.movePath(args.from, args.to);
       const publish = await publishIfConfigured(ctx, workspace, {
         message: `rename ${normalizeRelPath(args.from)} -> ${normalizeRelPath(args.to)}`,
+          tool: 'rename_file',
+          paths: [normalizeRelPath(args.from), normalizeRelPath(args.to)],
       });
       return withPublish(`Moved ${normalizeRelPath(args.from)} to ${normalizeRelPath(args.to)} in "${project.name}" (${project.id}).${publish.note}`, publish);
     },

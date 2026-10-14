@@ -59,9 +59,10 @@ RFC 8414 discovery). It is not optional — without it the server simply does no
 
 ## Features
 
-- **22 LaTeX-aware tools** — read, search, edit, rename, compile, undo, and review comments.
+- **26 LaTeX-aware tools** — read, search, edit, rename, compile, undo, change sets, and review comments.
 - **Edits land in Overleaf within seconds.** Each accepted change is published immediately, so
   your browser shows it without a manual sync.
+- **Atomic revisions.** `begin_change_set` groups a multi-file change so it lands all at once, or not at all.
 - **Every edit is versioned.** Each change is a git commit in a local mirror; `undo_last_edit`
   reverses recent edits with a real `git revert` and republishes.
 - **Fresh reads.** A file is re-fetched from Overleaf before it is read or edited, so an edit
@@ -84,7 +85,7 @@ RFC 8414 discovery). It is not optional — without it the server simply does no
                              ▼
                  ┌───────────────────────┐
                  │   LeafMCP server      │  ← runs on your server + domain
-                 │  · 22 LaTeX tools     │
+                 │  · 26 LaTeX tools     │
                  │  · OAuth 2.1 AS       │
                  │  · git-versioned      │
                  │    project mirrors    │
@@ -271,7 +272,7 @@ curl https://your-domain/.well-known/oauth-protected-resource
 
 ## Tools
 
-22 tools. Read tools carry `readOnlyHint`, mutating ones carry `destructiveHint`, and clients use
+26 tools. Read tools carry `readOnlyHint`, mutating ones carry `destructiveHint`, and clients use
 those hints to decide when to ask for confirmation.
 
 ### Projects
@@ -304,8 +305,12 @@ those hints to decide when to ask for confirmation.
 | `compile` | Compile on Overleaf; returns distilled errors/warnings and the PDF link. |
 | `publish_changes` | Push pending local edits to Overleaf. |
 | `pull_project` | Re-download the project from Overleaf. |
-| `edit_history` | Recent changes made through this server. |
-| `undo_last_edit` | **Reverse** the last N edits and republish. |
+| `edit_history` | Recent changes, each labelled with its operation id. |
+| `undo_operation` | **Reverse one specific operation**, leaving everything after it in place. |
+| `undo_last_edit` | Reverse the last N edits and republish. |
+| `begin_change_set` | Open a change set: the edits that follow are published together, or not at all. |
+| `commit_change_set` | Publish the open change set in one go. A failure leaves it open to retry. |
+| `abandon_change_set` | Discard the open change set and return the mirror to the state it opened from. |
 
 ### Review comments
 
@@ -327,6 +332,8 @@ those hints to decide when to ask for confirmation.
 - **One writer per project.** Every mutating tool runs under that project's lock, so the whole refresh → read → write → commit → publish sequence is atomic with respect to other clients. Without it, two edits arriving together both read the same base and the second discards the first. Different projects stay fully concurrent. This serialises within one process; two server instances must not share a data directory.
 - **A partial publish is an error, not a footnote.** If any file fails to reach Overleaf, the tool result is flagged as an error, because a warning inside an otherwise successful response is easy for a model to summarise away as "done" — and the user then believes their paper was updated.
 - **Edits can be pinned to a version.** `read_file` reports a `sha256:` prefix and `edit_file` accepts it as `expected_hash`, so an edit written against text that has since changed is refused rather than applied. Overleaf offers no atomic conditional write, so this cannot close the race between the check and the upload — but it turns the common case, "the user edited this after the model read it", into a conflict someone has to look at.
+- **Change sets make a revision atomic.** For work that spans several files, or that should not be visible half-finished, `begin_change_set` suspends publishing: the edits accumulate locally and reach Overleaf together on `commit_change_set`. Without it a five-file revision arrives one file at a time, and anyone reading the paper in between sees a state that never existed as a whole. `abandon_change_set` discards the lot, and nothing was ever published, so there is nothing to undo remotely.
+- **Every mutating call is an operation with an id.** Results and `edit_history` report it, and `undo_operation` reverses exactly that one, leaving later work alone. It reverts rather than resets, so the original edit stays in history and a mistaken undo is itself undoable. When a later edit has rewritten the same lines, the reversal is **refused** with the conflict reported — guessing which version was meant is how a tool destroys work it was asked to protect.
 - **Undo is real.** Every tool edit is a commit, and `undo_last_edit` uses `git revert`, so an
   undo is itself undoable. It deliberately refuses to reverse a *reload from Overleaf* — that
   would push a stale copy over whatever you changed in the browser.
@@ -491,11 +498,12 @@ src/
     workspace.ts          The git mirror: pull, change detection, push, undo
     latex.ts              LaTeX structure and summaries
     latexlog.ts           Compile-log distillation
-  tools/                22 tool handlers, decoupled from the MCP framework
+    journal.ts            Operations and change sets, for undo by id
+  tools/                26 tool handlers, decoupled from the MCP framework
     search.ts             Spawns and supervises the isolated search
     search-worker.ts      Runs the pattern somewhere it can be killed
   transport/http.ts     Express app: MCP endpoint, OAuth, health check
-test/smoke.mjs          End-to-end suite (244 checks)
+test/smoke.mjs          End-to-end suite (273 checks)
 docker/                 Dockerfile, compose, Caddyfile
 ```
 

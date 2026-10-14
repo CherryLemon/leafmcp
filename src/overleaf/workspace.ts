@@ -44,6 +44,7 @@ import {
   type GitRepo,
 } from '../util/git.js';
 import { log } from '../util/logger.js';
+import { ProjectJournal, type ChangeSetRecord } from './journal.js';
 import {
   assertInsideRealRoot,
   assertNotSymlink,
@@ -162,7 +163,11 @@ export class ProjectWorkspace {
     this.dir = join(root, 'projects', segment);
     this.gitDir = join(root, 'meta', `${segment}.git`);
     this.manifestPath = join(root, 'meta', `${segment}.sync.json`);
+    this.journal = new ProjectJournal(join(root, 'meta', `${segment}.journal.json`));
   }
+
+  /** Operations and change sets for this project; see `journal.ts`. */
+  readonly journal: ProjectJournal;
 
   private get repo(): GitRepo {
     return { gitDir: this.gitDir, workDir: this.dir };
@@ -764,6 +769,74 @@ export class ProjectWorkspace {
         const [sha = '', date = '', message = ''] = line.split('\t');
         return { sha, date, message };
       });
+  }
+
+  // ── change sets ──────────────────────────────────────────────────────────
+
+  /**
+   * Open a change set: everything edited until it is committed or abandoned stays local.
+   *
+   * This is where atomicity comes from. Without it, a five-file revision reaches Overleaf one
+   * file at a time and anyone reading the paper in between sees a state that never existed as
+   * a whole — and if the model stops half way, that state is simply left there.
+   */
+  async beginChangeSet(description: string): Promise<ChangeSetRecord> {
+    await this.ensure();
+    const base = await headSha(this.repo);
+    const record = await this.journal.begin(description, base);
+    log.info(`change set ${record.id} opened for ${this.projectId}: ${description}`);
+    return record;
+  }
+
+  /** Close the open change set. Callers publish first; a failed publish keeps it open. */
+  async closeChangeSet(outcome: 'committed' | 'abandoned'): Promise<ChangeSetRecord | null> {
+    return this.journal.close(outcome);
+  }
+
+  /**
+   * Discard the open change set and return the mirror to the state it opened from.
+   *
+   * Returns the files that were discarded, computed before the reset so the answer describes
+   * what was actually thrown away rather than what remains.
+   */
+  async abandonChangeSet(baseCommit: string | null): Promise<string[]> {
+    const discarded = await this.filesChangedSince(baseCommit);
+    if (baseCommit) {
+      await git(this.repo, ['reset', '--hard', '-q', baseCommit]);
+    }
+    await this.closeChangeSet('abandoned');
+    return discarded;
+  }
+
+  /** Paths differing between a commit and the current work tree, including untracked files. */
+  async filesChangedSince(commit: string | null): Promise<string[]> {
+    if (!commit) return this.listFiles();
+    const diff = await git(this.repo, ['diff', '--name-only', commit], true);
+    const untracked = await git(this.repo, ['ls-files', '--others', '--exclude-standard'], true);
+    return [...new Set([...diff.stdout.split('\n'), ...untracked.stdout.split('\n')].filter(Boolean))].sort();
+  }
+
+  /**
+   * Reverse one commit, leaving everything after it in place.
+   *
+   * Reverting rather than resetting is what makes this "undo that operation" instead of
+   * "discard everything since" — and it keeps the original edit in history, so a mistaken
+   * undo is itself undoable.
+   */
+  async revertCommit(commit: string): Promise<void> {
+    const revert = await git(this.repo, ['revert', '--no-commit', commit], true);
+    if (revert.code !== 0) {
+      await git(this.repo, ['revert', '--abort'], true);
+      // The explanation is the message, and git's own output is the detail. Putting the raw
+      // stderr in the message meant a caller only saw our explanation when git happened to be
+      // silent — which is the opposite of when it is needed.
+      throw new ToolError(
+        `could not reverse ${commit.slice(0, 8)}: the change conflicts with later edits`,
+        `git reported: ${(revert.stderr.trim() || revert.stdout.trim() || 'the revert did not apply').slice(0, 300)}. ` +
+          'Read the affected file and adjust it directly instead.',
+      );
+    }
+    await commitAll(this.repo, `undo operation ${commit.slice(0, 8)}`);
   }
 
   /**
